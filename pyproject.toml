@@ -1,0 +1,61 @@
+[project]
+name = "quantum-alpha-hunter"
+version = "0.1.0"
+description = "AI-powered quantitative trading system for identifying pre-breakout opportunities"
+requires-python = ">=3.11"
+dependencies = [
+    "pandas>=2.2",
+    "numpy>=1.26",
+    "scikit-learn>=1.5",
+    "yfinance>=0.2.43",
+    "praw>=7.7",
+    "snscrape==0.7.0.20230622",
+    "SQLAlchemy>=2.0",
+    "python-dotenv>=1.0",
+    "tqdm>=4.66",
+    "requests>=2.32",
+    "plotly>=5.24",
+    "streamlit>=1.38",
+    "pydantic>=2.8",
+    "ta>=0.11.0",
+    "talib-binary>=0.4.28",
+    "structlog>=23.0",
+    "click>=8.0",
+    "beautifulsoup4>=4.12",
+    "lxml>=5.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "black>=23.0",
+    "isort>=5.12",
+    "mypy>=1.0",
+    "pylint>=2.17",
+    "ipython>=8.0",
+    "jupyter>=1.0"
+]
+
+[project.scripts]
+qaht = "qaht.cli:main"
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+
+[tool.black]
+line-length = 100
+target-version = ['py311']
+
+[tool.isort]
+profile = "black"
+line_length = 100
+
+[tool.mypy]
+python_version = "3.11"
+warn_return_any = true
+warn_unused_configs = true
+ignore_missing_imports = true
