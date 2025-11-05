@@ -15,7 +15,7 @@ Sources:
 import logging
 import requests
 import xml.etree.ElementTree as ET
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Any
 from datetime import datetime, timedelta
 from dataclasses import dataclass
 
@@ -134,6 +134,8 @@ class InsiderTradingDetector:
                     updated = entry.find('atom:updated', ns)
                     if updated is not None:
                         filing_date = datetime.fromisoformat(updated.text.replace('Z', '+00:00'))
+                        # Convert to naive datetime for easier comparison
+                        filing_date = filing_date.replace(tzinfo=None)
                     else:
                         filing_date = datetime.now()
 
@@ -293,7 +295,7 @@ class InsiderTradingDetector:
         return signals
 
 
-def detect_insider_buying(tickers: Optional[List[str]] = None, days_back: int = 7) -> pd.DataFrame:
+def detect_insider_buying(tickers: Optional[List[str]] = None, days_back: int = 7) -> List[Dict]:
     """
     Detect insider buying activity.
 
@@ -302,7 +304,7 @@ def detect_insider_buying(tickers: Optional[List[str]] = None, days_back: int = 
         days_back: Days to look back
 
     Returns:
-        DataFrame with insider activity
+        List of dicts with insider activity
     """
     detector = InsiderTradingDetector()
 
