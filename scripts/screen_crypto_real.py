@@ -14,8 +14,10 @@ import logging
 import requests
 import time
 import pandas as pd
+import argparse
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional
+from pathlib import Path
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -26,13 +28,18 @@ class CryptoScreener:
     Real-time crypto screener using CoinGecko API.
     """
 
-    def __init__(self, api_key: Optional[str] = None):
+    def __init__(self, api_key: Optional[str] = None, cache_dir: str = "data/cache", force_refresh: bool = False):
         """
         Args:
             api_key: CoinGecko Pro API key (optional, free tier works)
+            cache_dir: Directory for caching results
+            force_refresh: If True, bypass cache and fetch fresh data
         """
         self.api_key = api_key
         self.base_url = "https://api.coingecko.com/api/v3"
+        self.cache_dir = Path(cache_dir)
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.force_refresh = force_refresh
         self.cache = {}
 
     def fetch_all_coins(self, vs_currency: str = 'usd', per_page: int = 250) -> List[Dict]:
@@ -46,6 +53,27 @@ class CryptoScreener:
         Returns:
             List of coin data
         """
+        # Check cache first (unless force refresh)
+        cache_file = self.cache_dir / f"coingecko_coins_{vs_currency}.json"
+
+        if not self.force_refresh and cache_file.exists():
+            import json
+            try:
+                cache_age = time.time() - cache_file.stat().st_mtime
+                if cache_age < 3600:  # 1 hour cache
+                    logger.info(f"Loading from cache ({cache_age/60:.1f} min old)...")
+                    with open(cache_file, 'r') as f:
+                        cached_data = json.load(f)
+                    logger.info(f"✅ Loaded {len(cached_data)} coins from cache")
+                    return cached_data
+                else:
+                    logger.info(f"Cache expired ({cache_age/3600:.1f}h old), fetching fresh data...")
+            except Exception as e:
+                logger.warning(f"Failed to load cache: {e}, fetching fresh data...")
+
+        if self.force_refresh:
+            logger.info("🔄 FORCE REFRESH: Bypassing cache, fetching fresh data...")
+
         all_coins = []
         page = 1
         max_pages = 8  # Get top 2000 coins (8 pages * 250)
@@ -85,6 +113,17 @@ class CryptoScreener:
                 break
 
         logger.info(f"Successfully fetched {len(all_coins)} coins")
+
+        # Save to cache
+        if all_coins:
+            import json
+            try:
+                with open(cache_file, 'w') as f:
+                    json.dump(all_coins, f)
+                logger.info(f"💾 Cached {len(all_coins)} coins for future use")
+            except Exception as e:
+                logger.warning(f"Failed to save cache: {e}")
+
         return all_coins
 
     def calculate_scam_score(self, coin: Dict) -> Dict:
@@ -259,19 +298,26 @@ class CryptoScreener:
         return df
 
 
-def screen_crypto():
-    """Screen cryptocurrencies with multiple strategies."""
+def screen_crypto(force_refresh: bool = False):
+    """
+    Screen cryptocurrencies with multiple strategies.
+
+    Args:
+        force_refresh: If True, bypass cache and fetch fresh data
+    """
 
     print("="*80)
     print("🪙 REAL-TIME CRYPTOCURRENCY SCREENER")
     print("="*80)
     print()
     print("Using CoinGecko API - NO SIMULATION, REAL DATA")
+    if force_refresh:
+        print("🔄 FORCE REFRESH MODE: Bypassing cache")
     print()
     print("="*80)
     print()
 
-    screener = CryptoScreener()
+    screener = CryptoScreener(force_refresh=force_refresh)
 
     # SCREEN 1: Quality Coins (scam-filtered, liquid)
     print("📊 SCREEN 1: Quality Coins (Scam-Filtered, Liquid)")
@@ -412,4 +458,26 @@ def screen_crypto():
 
 
 if __name__ == '__main__':
-    screen_crypto()
+    parser = argparse.ArgumentParser(
+        description='Real-time cryptocurrency screener',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python screen_crypto_real.py                    # Use cache if available
+  python screen_crypto_real.py --force-refresh    # Bypass cache, fetch fresh data
+
+Force refresh is useful when:
+- Breaking news just happened
+- You need the latest prices
+- Verifying signal accuracy
+- Testing the system
+        """
+    )
+    parser.add_argument(
+        '--force-refresh',
+        action='store_true',
+        help='Bypass cache and fetch fresh data immediately (slower but most current)'
+    )
+
+    args = parser.parse_args()
+    screen_crypto(force_refresh=args.force_refresh)
