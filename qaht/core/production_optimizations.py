@@ -36,6 +36,11 @@ logger = logging.getLogger(__name__)
 # CIRCUIT BREAKER - Stop hammering failing APIs
 # ============================================================================
 
+class CircuitBreakerOpenError(Exception):
+    """Raised when circuit breaker is open and rejects requests"""
+    pass
+
+
 class CircuitBreaker:
     """
     Circuit breaker pattern to prevent cascading failures.
@@ -73,7 +78,7 @@ class CircuitBreaker:
                     logger.info(f"Circuit breaker {func.__name__}: OPEN -> HALF_OPEN")
                 else:
                     # Still open, reject immediately
-                    raise Exception(f"Circuit breaker OPEN for {func.__name__}")
+                    raise CircuitBreakerOpenError(f"Circuit breaker OPEN for {func.__name__}")
 
         try:
             result = func(*args, **kwargs)
