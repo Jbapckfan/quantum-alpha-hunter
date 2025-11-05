@@ -142,8 +142,6 @@ Source names:
         cmd_status(manager)
     elif args.command == 'enable':
         cmd_enable(manager, args.source)
-    elif args.command == 'status':
-        cmd_status(manager)
     elif args.command == 'disable':
         cmd_disable(manager, args.source)
 

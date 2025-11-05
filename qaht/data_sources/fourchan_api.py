@@ -5,6 +5,7 @@ Very early signals (high noise). Use caution.
 import logging
 import requests
 from typing import List, Dict
+from qaht.utils.validation import validate_ticker, ValidationError
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +26,13 @@ class FourChanBizAPI:
             
     def search_ticker_mentions(self, ticker: str) -> int:
         """Count mentions of a ticker in recent threads"""
+        # Validate ticker input
+        try:
+            ticker = validate_ticker(ticker, allow_crypto=True)
+        except ValidationError as e:
+            logger.error(f"Invalid ticker for 4chan search: {e}")
+            return 0
+
         catalog = self.get_catalog()
         count = 0
         for page in catalog:

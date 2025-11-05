@@ -16,6 +16,7 @@ import logging
 import requests
 from typing import List, Dict, Optional
 from datetime import datetime
+from qaht.utils.validation import validate_api_key, sanitize_query, mask_secret, ValidationError
 
 logger = logging.getLogger(__name__)
 
@@ -24,11 +25,24 @@ class YouTubeAPI:
     """YouTube Data API v3 client (FREE - 10K queries/day)"""
 
     def __init__(self, api_key: str):
-        self.api_key = api_key
+        # Validate API key
+        try:
+            self.api_key = validate_api_key(api_key, "YouTube", min_length=20)
+            logger.info(f"YouTube API initialized with key: {mask_secret(self.api_key)}")
+        except ValidationError as e:
+            logger.error(f"YouTube API key validation failed: {e}")
+            raise
         self.base_url = "https://www.googleapis.com/youtube/v3"
 
     def search_videos(self, query: str, max_results: int = 10) -> List[Dict]:
         """Search for videos about a topic/ticker"""
+        # Sanitize search query
+        try:
+            query = sanitize_query(query, max_length=100)
+        except ValidationError as e:
+            logger.error(f"Invalid YouTube search query: {e}")
+            return []
+
         try:
             url = f"{self.base_url}/search"
             params = {

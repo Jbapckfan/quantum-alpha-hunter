@@ -17,6 +17,7 @@ import requests
 import time
 from typing import List, Dict, Optional
 from datetime import datetime
+from qaht.utils.validation import validate_ticker, ValidationError
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +47,13 @@ class StockTwitsAPI:
         Returns:
             Dict with messages and sentiment data
         """
+        # Validate ticker input
+        try:
+            symbol = validate_ticker(symbol, allow_crypto=True)
+        except ValidationError as e:
+            logger.error(f"Invalid symbol for StockTwits: {e}")
+            return self._empty_result(symbol)
+
         try:
             url = f"{self.base_url}/streams/symbol/{symbol}.json"
             params = {'limit': min(limit, 30)}
@@ -132,6 +140,13 @@ class StockTwitsAPI:
         Returns:
             Watchlist count
         """
+        # Validate ticker input
+        try:
+            symbol = validate_ticker(symbol, allow_crypto=True)
+        except ValidationError as e:
+            logger.error(f"Invalid symbol for watchlist: {e}")
+            return 0
+
         try:
             url = f"{self.base_url}/symbols/{symbol}.json"
 

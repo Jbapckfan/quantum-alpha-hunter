@@ -5,6 +5,7 @@ Quality analysis and earnings coverage
 import logging
 import feedparser
 from typing import List, Dict
+from qaht.utils.validation import validate_ticker, ValidationError
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +26,13 @@ class SeekingAlphaRSS:
             
     def get_symbol_news(self, symbol: str) -> List[Dict]:
         """Get news for specific symbol"""
+        # Validate symbol input
+        try:
+            symbol = validate_ticker(symbol, allow_crypto=False)
+        except ValidationError as e:
+            logger.error(f"Invalid symbol for Seeking Alpha: {e}")
+            return []
+
         try:
             url = f"{self.base_url}/api/sa/combined/{symbol}.xml"
             feed = feedparser.parse(url)

@@ -250,7 +250,8 @@ class RobustNewsCollector:
 
             try:
                 published = datetime.fromisoformat(article['publishedAt'].replace('Z', '+00:00'))
-            except:
+            except (ValueError, TypeError, KeyError, AttributeError) as e:
+                logger.debug(f"Failed to parse date from NewsAPI: {e}")
                 published = datetime.now()
 
             articles.append({
@@ -306,7 +307,8 @@ class RobustNewsCollector:
         for entry in feed.entries:
             try:
                 published = datetime(*entry.published_parsed[:6])
-            except:
+            except (ValueError, TypeError, AttributeError) as e:
+                logger.debug(f"Failed to parse date from Google News RSS: {e}")
                 published = datetime.now()
 
             articles.append({
@@ -373,7 +375,8 @@ class RobustNewsCollector:
         for article in data:
             try:
                 published = datetime.fromtimestamp(article['datetime'])
-            except:
+            except (ValueError, TypeError, KeyError, OSError) as e:
+                logger.debug(f"Failed to parse date from Finnhub: {e}")
                 published = datetime.now()
 
             articles.append({
@@ -428,7 +431,8 @@ class RobustNewsCollector:
         for entry in feed.entries:
             try:
                 published = datetime(*entry.published_parsed[:6])
-            except:
+            except (ValueError, TypeError, AttributeError) as e:
+                logger.debug(f"Failed to parse date from Yahoo Finance RSS: {e}")
                 published = datetime.now()
 
             articles.append({
