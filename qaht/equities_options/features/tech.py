@@ -270,12 +270,13 @@ def compute_all_technical_features(df: pd.DataFrame) -> Dict[str, float]:
     return features
 
 
-def upsert_factors_for_symbol(symbol: str):
+def upsert_factors_for_symbol(symbol: str, compute_all_dates: bool = True):
     """
     Compute and store technical features for a symbol
 
     Args:
         symbol: Ticker symbol
+        compute_all_dates: If True, compute for all dates; if False, only latest
     """
     with session_scope() as session:
         # Get price data
@@ -299,34 +300,56 @@ def upsert_factors_for_symbol(symbol: str):
             'volume': p.volume
         } for p in prices])
 
-        # Compute features for latest date
-        features = compute_all_technical_features(df)
+        # Determine which dates to compute
+        if compute_all_dates:
+            # Compute for all dates (needed for backtesting/training)
+            # Need at least 200 days for MAs
+            min_rows_needed = 200
+            dates_to_compute = []
 
-        if not features:
-            logger.warning(f"No features computed for {symbol}")
-            return
+            for i in range(min_rows_needed, len(df)):
+                dates_to_compute.append(i)
 
-        latest_date = df['date'].iloc[-1]
-
-        # CRITICAL FIX: Use tuple for composite primary key
-        existing = session.get(Factors, (symbol, latest_date))
-
-        if existing:
-            # Update existing
-            for key, value in features.items():
-                if hasattr(existing, key):
-                    setattr(existing, key, value)
+            logger.info(f"Computing technical features for {symbol}: {len(dates_to_compute)} dates")
         else:
-            # Create new (with null social features initially)
-            factor = Factors(
-                symbol=symbol,
-                date=latest_date,
-                social_delta_7d=None,
-                author_entropy_7d=None,
-                engagement_ratio_7d=None,
-                trends_delta_7d=None,
-                **features
-            )
-            session.add(factor)
+            # Only compute latest (for live scoring)
+            dates_to_compute = [len(df) - 1]
 
-        logger.debug(f"Upserted features for {symbol} on {latest_date}")
+        # Compute features for each date
+        upserted_count = 0
+
+        for idx in dates_to_compute:
+            # Get data up to this date
+            df_subset = df.iloc[:idx+1]
+            current_date = df_subset['date'].iloc[-1]
+
+            # Compute features
+            features = compute_all_technical_features(df_subset)
+
+            if not features:
+                continue
+
+            # Upsert to database
+            existing = session.get(Factors, (symbol, current_date))
+
+            if existing:
+                # Update existing
+                for key, value in features.items():
+                    if hasattr(existing, key):
+                        setattr(existing, key, value)
+            else:
+                # Create new (with null social features initially)
+                factor = Factors(
+                    symbol=symbol,
+                    date=current_date,
+                    social_delta_7d=None,
+                    author_entropy_7d=None,
+                    engagement_ratio_7d=None,
+                    trends_delta_7d=None,
+                    **features
+                )
+                session.add(factor)
+
+            upserted_count += 1
+
+        logger.info(f"Upserted {upserted_count} factor rows for {symbol}")
