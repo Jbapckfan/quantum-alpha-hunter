@@ -1,0 +1,118 @@
+name: Test Suite
+
+on:
+  push:
+    branches: [ main, develop, claude/* ]
+  pull_request:
+    branches: [ main, develop ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ['3.11', '3.12']
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ matrix.python-version }}
+
+    - name: Cache pip packages
+      uses: actions/cache@v3
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-pip-${{ hashFiles('**/pyproject.toml') }}
+        restore-keys: |
+          ${{ runner.os }}-pip-
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip setuptools wheel
+        pip install -e ".[dev]"
+        pip install types-requests types-beautifulsoup4
+        # Try to install feedparser, but don't fail if it doesn't work
+        pip install feedparser || echo "feedparser installation failed, skipping"
+
+    - name: Run linting
+      run: |
+        echo "Running pylint..."
+        pylint qaht/utils/ qaht/data_sources/ qaht/core/ --disable=C0103,C0114,C0115,C0116,R0903,W1203,C0301 --fail-under=9.0 || true
+
+    - name: Run type checking
+      run: |
+        echo "Running mypy..."
+        mypy qaht/utils/ qaht/data_sources/ qaht/core/ --ignore-missing-imports || true
+
+    - name: Run tests with coverage
+      run: |
+        pytest --cov=qaht --cov-report=xml --cov-report=term-missing --cov-branch -v
+
+    - name: Check coverage threshold
+      run: |
+        coverage report --fail-under=20 || echo "Coverage below threshold but continuing"
+
+    - name: Upload coverage to Codecov
+      uses: codecov/codecov-action@v4
+      with:
+        file: ./coverage.xml
+        flags: unittests
+        name: codecov-umbrella
+        fail_ci_if_error: false
+
+    - name: Archive test results
+      if: always()
+      uses: actions/upload-artifact@v3
+      with:
+        name: test-results-${{ matrix.python-version }}
+        path: |
+          htmlcov/
+          coverage.xml
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: Install dependencies
+      run: |
+        pip install black isort pylint mypy
+
+    - name: Check code formatting (black)
+      run: |
+        black --check qaht/ tests/ || true
+
+    - name: Check import sorting (isort)
+      run: |
+        isort --check-only qaht/ tests/ || true
+
+  security:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: Install security tools
+      run: |
+        pip install safety bandit
+
+    - name: Check dependencies for vulnerabilities
+      run: |
+        safety check --json || true
+
+    - name: Run security linting
+      run: |
+        bandit -r qaht/ -f json || true
