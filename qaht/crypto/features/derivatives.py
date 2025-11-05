@@ -80,11 +80,10 @@ def compute_funding_rate_delta(symbol: str, window: int = 7):
                 session.add(factor)
 
             # Update derivatives features (crypto-specific columns)
-            # Note: These need to be added to Factors schema
             if pd.notna(row['funding_rate_delta_7d']):
-                # For now, store in existing columns as placeholder
-                # TODO: Add funding_rate_delta_7d, oi_delta_7d columns to schema
-                pass
+                factor.funding_rate_delta_7d = float(row['funding_rate_delta_7d'])
+            if pd.notna(row['oi_delta_7d']):
+                factor.oi_delta_7d = float(row['oi_delta_7d'])
 
         logger.debug(f"Updated derivatives features for {symbol}")
 

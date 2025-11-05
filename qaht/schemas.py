@@ -74,6 +74,10 @@ class Factors(Base):
     macd: Mapped[float] = mapped_column(Float, nullable=True)
     macd_signal: Mapped[float] = mapped_column(Float, nullable=True)
 
+    # Crypto derivatives features (Phase 2 - crypto specific)
+    funding_rate_delta_7d: Mapped[float] = mapped_column(Float, nullable=True)
+    oi_delta_7d: Mapped[float] = mapped_column(Float, nullable=True)
+
 
 class Labels(Base):
     """Event labels for training"""
