@@ -5,9 +5,10 @@ Provides consistent error handling patterns across all API integrations.
 """
 import logging
 import functools
-from typing import Callable, Any, Optional
-import requests
+import time
 from datetime import datetime
+from typing import Callable, Any, Optional, List
+import requests
 
 logger = logging.getLogger(__name__)
 
@@ -157,9 +158,9 @@ def safe_get(data: dict, *keys, default=None):
 
 def parse_timestamp(
     timestamp_str: str,
-    formats: list = None,
+    formats: Optional[List[str]] = None,
     default: Optional[datetime] = None
-) -> datetime:
+) -> Optional[datetime]:
     """
     Parse timestamp string with multiple format attempts
 
@@ -233,8 +234,6 @@ class RetryableRequest:
 
     def _request(self, method: str, url: str, **kwargs) -> requests.Response:
         """Execute request with retries and exponential backoff"""
-        import time
-
         kwargs.setdefault('timeout', self.timeout)
 
         last_exception = None

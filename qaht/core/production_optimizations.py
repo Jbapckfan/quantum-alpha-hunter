@@ -64,7 +64,7 @@ class CircuitBreaker:
         self.expected_exception = expected_exception
 
         self.failure_count = 0
-        self.last_failure_time = None
+        self.last_failure_time: Optional[datetime] = None
         self.state = 'CLOSED'
         self._lock = threading.Lock()
 
@@ -73,7 +73,7 @@ class CircuitBreaker:
         with self._lock:
             if self.state == 'OPEN':
                 # Check if recovery timeout passed
-                if datetime.now() - self.last_failure_time > timedelta(seconds=self.recovery_timeout):
+                if self.last_failure_time and datetime.now() - self.last_failure_time > timedelta(seconds=self.recovery_timeout):
                     self.state = 'HALF_OPEN'
                     logger.info(f"Circuit breaker {func.__name__}: OPEN -> HALF_OPEN")
                 else:
@@ -122,10 +122,10 @@ class AdaptiveRateLimiter:
     """
 
     def __init__(self, default_delay: float = 1.0):
-        self.delays = defaultdict(lambda: default_delay)
-        self.last_call = defaultdict(lambda: datetime.min)
-        self.consecutive_success = defaultdict(int)
-        self._locks = defaultdict(threading.Lock)
+        self.delays: Dict[str, float] = defaultdict(lambda: default_delay)
+        self.last_call: Dict[str, datetime] = defaultdict(lambda: datetime.min)
+        self.consecutive_success: Dict[str, int] = defaultdict(int)
+        self._locks: Dict[str, threading.Lock] = defaultdict(threading.Lock)
 
     def wait(self, endpoint: str):
         """Wait before calling endpoint."""
