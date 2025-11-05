@@ -1,0 +1,140 @@
+# News & Social Sources Configuration
+# Toggle sources on/off easily here
+
+news_sources:
+  newsapi:
+    enabled: true
+    name: "NewsAPI"
+    type: "news"
+    cost: "FREE"
+    rate_limit: "100 calls/day"
+    requires_api_key: true
+
+  google_news:
+    enabled: true
+    name: "Google News RSS"
+    type: "news"
+    cost: "FREE"
+    rate_limit: "unlimited"
+    requires_api_key: false
+
+  finnhub:
+    enabled: true
+    name: "Finnhub"
+    type: "news"
+    cost: "FREE"
+    rate_limit: "60 calls/min"
+    requires_api_key: true
+
+  yahoo_finance:
+    enabled: true
+    name: "Yahoo Finance RSS"
+    type: "news"
+    cost: "FREE"
+    rate_limit: "unlimited"
+    requires_api_key: false
+
+  seeking_alpha:
+    enabled: true
+    name: "Seeking Alpha RSS"
+    type: "news"
+    cost: "FREE"
+    rate_limit: "unlimited"
+    requires_api_key: false
+
+social_sources:
+  reddit:
+    enabled: true
+    name: "Reddit"
+    type: "social"
+    cost: "FREE"
+    rate_limit: "60 calls/min"
+    requires_api_key: true
+    subreddits:
+      stocks:
+        - wallstreetbets
+        - stocks
+        - investing
+        - StockMarket
+        - pennystocks
+        - Shortsqueeze
+        - smallstreetbets
+      crypto:
+        - CryptoCurrency
+        - CryptoMarkets
+        - CryptoMoonShots
+        - SatoshiStreetBets
+
+  stocktwits:
+    enabled: true
+    name: "StockTwits"
+    type: "social"
+    cost: "FREE"
+    rate_limit: "200 calls/hour"
+    requires_api_key: false
+
+  youtube:
+    enabled: true
+    name: "YouTube"
+    type: "social"
+    cost: "FREE"
+    rate_limit: "10000 queries/day"
+    requires_api_key: true
+    channels:
+      stocks:
+        - UC8wT9Q_FcX0VJzEg-ULrxLw  # Meet Kevin
+        - UC9OJ8BVH1l6PqerEAz11HSQ  # Andrei Jikh
+        - UCV6KDgJskWaEckne5aPA0aQ  # Graham Stephan
+      crypto:
+        - UCqK_GSMbpiV8spgD3ZGloSw  # Coin Bureau
+        - UCbLhGKVY-bJPcawebgtNfbw  # Altcoin Daily
+
+  telegram:
+    enabled: true
+    name: "Telegram"
+    type: "social"
+    cost: "FREE"
+    rate_limit: "unlimited"
+    requires_api_key: true
+    groups:
+      - "CryptoSignals"
+      - "BinanceEnglish"
+      - "CryptoWhales"
+
+  fourchan:
+    enabled: false  # High noise, disabled by default
+    name: "4chan /biz/"
+    type: "social"
+    cost: "FREE"
+    rate_limit: "1 call/sec"
+    requires_api_key: false
+    warning: "High noise to signal ratio. Use with caution."
+
+  lunarcrush:
+    enabled: true
+    name: "LunarCrush"
+    type: "crypto_social"
+    cost: "FREE"
+    rate_limit: "150 calls/month"
+    requires_api_key: true
+
+# Advanced Settings
+settings:
+  cache_enabled: true
+  cache_hours: 1
+  force_refresh: false
+  min_confidence_score: 70
+  enable_sentiment_analysis: true
+  parallel_fetching: true
+  max_workers: 5
+  retry_failed_sources: true
+  retry_max_attempts: 3
+
+# Notifications (optional)
+notifications:
+  enabled: false
+  min_alert_score: 80
+  methods:
+    email: false
+    webhook: false
+    desktop: false
