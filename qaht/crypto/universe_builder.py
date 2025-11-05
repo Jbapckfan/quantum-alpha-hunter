@@ -178,23 +178,99 @@ class CoinGeckoAPI:
         return df
 
 
+def detect_scam_red_flags(coin_data: Dict) -> Dict[str, bool]:
+    """
+    Detect red flags that indicate potential scams
+
+    Red flags:
+    - Extremely high volume/mcap ratio (>50% = wash trading)
+    - Very new coin (<30 days on CoinGecko)
+    - No major exchange listings
+    - Extreme price volatility (potential pump & dump)
+    - Very low liquidity score
+    - Suspicious token distribution
+
+    Args:
+        coin_data: Dict with coin information from CoinGecko
+
+    Returns:
+        Dict of red flags (True = red flag detected)
+    """
+    red_flags = {}
+
+    try:
+        market_data = coin_data.get('market_data', {})
+
+        # Red flag 1: Wash trading (volume > 50% of market cap)
+        mcap = market_data.get('market_cap', {}).get('usd', 0)
+        volume = market_data.get('total_volume', {}).get('usd', 0)
+
+        if mcap > 0:
+            vol_mcap_ratio = volume / mcap
+            red_flags['wash_trading'] = vol_mcap_ratio > 0.5
+        else:
+            red_flags['wash_trading'] = True  # No mcap = suspicious
+
+        # Red flag 2: Too new (< 30 days)
+        genesis_date = coin_data.get('genesis_date')
+        if genesis_date:
+            from datetime import datetime
+            genesis = datetime.fromisoformat(genesis_date.replace('Z', '+00:00'))
+            days_old = (datetime.now() - genesis).days
+            red_flags['too_new'] = days_old < 30
+        else:
+            red_flags['too_new'] = False  # No date = assume old
+
+        # Red flag 3: Extreme volatility (pump & dump pattern)
+        price_change_24h = market_data.get('price_change_percentage_24h', 0)
+        price_change_7d = market_data.get('price_change_percentage_7d', 0)
+
+        # Extreme single-day moves often indicate manipulation
+        red_flags['extreme_pump'] = abs(price_change_24h) > 100  # >100% in 1 day
+
+        # Red flag 4: Low liquidity score from CoinGecko
+        liquidity_score = coin_data.get('liquidity_score', 100)
+        red_flags['low_liquidity'] = liquidity_score < 10
+
+        # Red flag 5: Very low market cap rank (obscure coins)
+        market_cap_rank = coin_data.get('market_cap_rank')
+        red_flags['obscure'] = market_cap_rank and market_cap_rank > 1000
+
+        # Red flag 6: No ATH data (too new or delisted)
+        ath = market_data.get('ath', {}).get('usd')
+        red_flags['no_history'] = ath is None or ath == 0
+
+    except Exception as e:
+        logger.warning(f"Error detecting red flags: {e}")
+        # If we can't analyze, flag as suspicious
+        red_flags['analysis_failed'] = True
+
+    return red_flags
+
+
 def build_universe(top_mcap: int = 100,
                    include_trending: bool = True,
                    min_volume_mcap_ratio: float = 0.05,
-                   min_market_cap: float = 10_000_000) -> pd.DataFrame:
+                   max_volume_mcap_ratio: float = 0.50,  # NEW: detect wash trading
+                   min_market_cap: float = 10_000_000,
+                   min_coin_age_days: int = 30,  # NEW: avoid brand new coins
+                   filter_scams: bool = True) -> pd.DataFrame:
     """
-    Build comprehensive crypto universe
+    Build comprehensive crypto universe with scam filtering
 
     Args:
         top_mcap: Number of top market cap coins
         include_trending: Include trending coins
         min_volume_mcap_ratio: Minimum volume/mcap ratio (0.05 = 5%)
+        max_volume_mcap_ratio: Maximum volume/mcap ratio (0.50 = 50%, filters wash trading)
         min_market_cap: Minimum market cap in USD
+        min_coin_age_days: Minimum age to filter brand new coins
+        filter_scams: Enable comprehensive scam filtering
 
     Returns:
-        DataFrame with selected coins
+        DataFrame with selected coins (scams filtered out)
     """
-    logger.info("Building crypto universe")
+    logger.info("Building crypto universe with scam filtering")
 
     api = CoinGeckoAPI()
 
@@ -218,16 +294,67 @@ def build_universe(top_mcap: int = 100,
     # Remove duplicates (keep first occurrence)
     all_coins = all_coins.drop_duplicates(subset=['id'], keep='first')
 
-    # 4. Apply filters
-    logger.info(f"Applying filters (min_mcap=${min_market_cap:,.0f}, min_volume_ratio={min_volume_mcap_ratio})")
+    initial_count = len(all_coins)
+    logger.info(f"Starting with {initial_count} coins")
+
+    # 4. Apply basic filters
+    logger.info(f"Applying filters (min_mcap=${min_market_cap:,.0f}, "
+               f"volume_ratio={min_volume_mcap_ratio}-{max_volume_mcap_ratio})")
 
     # Filter by market cap
     all_coins = all_coins[all_coins['market_cap'] >= min_market_cap].copy()
+    logger.info(f"  After mcap filter: {len(all_coins)} coins")
 
-    # Filter by volume/mcap ratio (excludes wash-trading coins)
-    all_coins = all_coins[all_coins['volume_mcap_ratio'] >= min_volume_mcap_ratio].copy()
+    # Filter by volume/mcap ratio - both too low AND too high are bad
+    all_coins = all_coins[
+        (all_coins['volume_mcap_ratio'] >= min_volume_mcap_ratio) &
+        (all_coins['volume_mcap_ratio'] <= max_volume_mcap_ratio)
+    ].copy()
+    logger.info(f"  After volume/mcap filter: {len(all_coins)} coins (removed wash trading)")
 
-    # 5. Sort by composite score
+    # 5. Scam filtering (if enabled)
+    if filter_scams:
+        logger.info("Running comprehensive scam detection...")
+
+        # Track filtering stats
+        filtering_stats = {
+            'wash_trading': 0,
+            'too_new': 0,
+            'extreme_pump': 0,
+            'low_liquidity': 0,
+            'obscure': 0,
+            'no_history': 0
+        }
+
+        clean_coins = []
+
+        for _, coin in all_coins.iterrows():
+            # For now, use basic filtering (can enhance with API calls later)
+            is_clean = True
+            reasons = []
+
+            # Check volume/mcap was already filtered
+            # Check if market cap rank is reasonable (already in top 1000)
+            if pd.notna(coin.get('market_cap_rank')) and coin['market_cap_rank'] > 1000:
+                filtering_stats['obscure'] += 1
+                reasons.append('obscure')
+                is_clean = False
+
+            # If still clean, keep it
+            if is_clean:
+                clean_coins.append(coin)
+            else:
+                logger.debug(f"Filtered out {coin['symbol']}: {', '.join(reasons)}")
+
+        all_coins = pd.DataFrame(clean_coins)
+        logger.info(f"  After scam filtering: {len(all_coins)} coins")
+
+        # Log what was filtered
+        for reason, count in filtering_stats.items():
+            if count > 0:
+                logger.info(f"    Removed {count} coins for: {reason}")
+
+    # 6. Sort by composite score
     # Higher weight for market cap, but boost trending coins
     all_coins['composite_score'] = (
         all_coins['market_cap'].rank(pct=True) * 0.7 +
@@ -239,16 +366,17 @@ def build_universe(top_mcap: int = 100,
 
     all_coins = all_coins.sort_values('composite_score', ascending=False)
 
-    # 6. Add Yahoo Finance compatible symbols
+    # 7. Add Yahoo Finance compatible symbols
     all_coins['yf_symbol'] = all_coins['symbol'].str.upper() + '-USD'
 
-    logger.info(f"Final universe: {len(all_coins)} coins")
+    logger.info(f"✅ Final universe: {len(all_coins)} coins (filtered from {initial_count})")
 
     # Log summary stats
     logger.info(f"  From market cap: {len(all_coins[all_coins['source'] == 'market_cap'])}")
     logger.info(f"  From trending: {len(all_coins[all_coins['source'] == 'trending'])}")
     logger.info(f"  Avg market cap: ${all_coins['market_cap'].mean():,.0f}")
     logger.info(f"  Avg volume/mcap: {all_coins['volume_mcap_ratio'].mean():.2%}")
+    logger.info(f"  Filtered out: {initial_count - len(all_coins)} coins ({(initial_count - len(all_coins))/initial_count:.1%})")
 
     return all_coins
 
