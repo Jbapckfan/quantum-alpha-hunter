@@ -17,6 +17,8 @@ import requests
 from typing import List, Dict, Optional
 from datetime import datetime
 from qaht.utils.validation import validate_api_key, sanitize_query, mask_secret, ValidationError
+from qaht.utils.error_handling import handle_api_errors
+from qaht.core.production_optimizations import CircuitBreaker, AdaptiveRateLimiter
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +35,12 @@ class YouTubeAPI:
             logger.error(f"YouTube API key validation failed: {e}")
             raise
         self.base_url = "https://www.googleapis.com/youtube/v3"
+        self.circuit_breaker = CircuitBreaker(
+            failure_threshold=3,
+            recovery_timeout=120,
+            expected_exception=Exception
+        )
+        self.rate_limiter = AdaptiveRateLimiter(default_delay=0.5)
 
     def search_videos(self, query: str, max_results: int = 10) -> List[Dict]:
         """Search for videos about a topic/ticker"""

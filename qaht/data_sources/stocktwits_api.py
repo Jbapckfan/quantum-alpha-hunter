@@ -18,6 +18,8 @@ import time
 from typing import List, Dict, Optional
 from datetime import datetime
 from qaht.utils.validation import validate_ticker, ValidationError
+from qaht.utils.error_handling import handle_api_errors
+from qaht.core.production_optimizations import CircuitBreaker, AdaptiveRateLimiter
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +37,12 @@ class StockTwitsAPI:
         self.session.headers.update({
             'User-Agent': 'QuantumAlphaHunter/1.0'
         })
+        self.circuit_breaker = CircuitBreaker(
+            failure_threshold=5,
+            recovery_timeout=180,  # 3 minutes
+            expected_exception=Exception
+        )
+        self.rate_limiter = AdaptiveRateLimiter(default_delay=2.0)
 
     def get_stream(self, symbol: str, limit: int = 30) -> Dict:
         """
@@ -162,16 +170,21 @@ class StockTwitsAPI:
             logger.debug(f"Failed to get watchlist count for {symbol}: {e}")
             return 0
 
-    def batch_sentiment(self, symbols: List[str], delay: float = 0.5) -> Dict[str, Dict]:
+    def batch_sentiment(self, symbols: List[str], delay: float = 2.0) -> Dict[str, Dict]:
         """
         Get sentiment for multiple symbols (respects rate limits)
 
         Args:
             symbols: List of ticker symbols
-            delay: Delay between requests in seconds (default: 0.5s = 120/hour)
+            delay: Delay between requests in seconds (default: 2.0s = 1800/hour - safe for bursts)
 
         Returns:
             Dict mapping symbol -> sentiment data
+
+        Notes:
+            StockTwits rate limit: 200 calls/hour = 1 call per 18 seconds
+            Default 2s delay allows bursts of up to 1800 calls/hour for small batches,
+            but you should use adaptive_delay=True for large batches to avoid hitting limits.
         """
         results = {}
 
@@ -180,10 +193,15 @@ class StockTwitsAPI:
 
             results[symbol] = self.get_stream(symbol)
 
-            # Rate limit: 200 calls/hour = 1 call per 18 seconds
-            # We use 0.5s delay for safety (allows burst, then backs off)
+            # Adaptive rate limiting: use longer delays for larger batches
             if i < len(symbols) - 1:
-                time.sleep(delay)
+                # For large batches (>10 symbols), use safer 18s delay
+                # For small batches, use faster delay to allow bursts
+                adaptive_delay = delay if len(symbols) <= 10 else 18.0
+                time.sleep(adaptive_delay)
+
+                if len(symbols) > 10 and i % 10 == 0:
+                    logger.info(f"Rate limiting: {adaptive_delay}s delay for batch of {len(symbols)} symbols")
 
         logger.info(f"Fetched StockTwits sentiment for {len(results)} symbols")
         return results

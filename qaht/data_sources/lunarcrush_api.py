@@ -6,6 +6,8 @@ import logging
 import requests
 from typing import List, Dict
 from qaht.utils.validation import validate_api_key, validate_ticker, mask_secret, ValidationError
+from qaht.utils.error_handling import handle_api_errors
+from qaht.core.production_optimizations import CircuitBreaker, AdaptiveRateLimiter
 
 logger = logging.getLogger(__name__)
 
@@ -19,6 +21,12 @@ class LunarCrushAPI:
             logger.error(f"LunarCrush API key validation failed: {e}")
             raise
         self.base_url = "https://lunarcrush.com/api3"
+        self.circuit_breaker = CircuitBreaker(
+            failure_threshold=3,
+            recovery_timeout=120,
+            expected_exception=Exception
+        )
+        self.rate_limiter = AdaptiveRateLimiter(default_delay=1.0)
         
     def get_market_data(self, symbol: str) -> Dict:
         """Get social + price data for a coin"""

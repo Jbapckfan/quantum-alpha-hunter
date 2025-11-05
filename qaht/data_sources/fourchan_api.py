@@ -6,23 +6,30 @@ import logging
 import requests
 from typing import List, Dict
 from qaht.utils.validation import validate_ticker, ValidationError
+from qaht.utils.error_handling import handle_api_errors
+from qaht.core.production_optimizations import CircuitBreaker
 
 logger = logging.getLogger(__name__)
 
 class FourChanBizAPI:
     def __init__(self):
         self.base_url = "https://a.4cdn.org/biz"
+        self.circuit_breaker = CircuitBreaker(
+            failure_threshold=3,
+            recovery_timeout=300,  # 5 minutes
+            expected_exception=Exception
+        )
         
+    @handle_api_errors("4chan", default_return=[], log_level="warning")
     def get_catalog(self) -> List[Dict]:
         """Get /biz/ catalog threads"""
-        try:
+        def _fetch():
             url = f"{self.base_url}/catalog.json"
             response = requests.get(url, timeout=10)
             response.raise_for_status()
             return response.json()
-        except Exception as e:
-            logger.error(f"4chan fetch failed: {e}")
-            return []
+
+        return self.circuit_breaker.call(_fetch)
             
     def search_ticker_mentions(self, ticker: str) -> int:
         """Count mentions of a ticker in recent threads"""

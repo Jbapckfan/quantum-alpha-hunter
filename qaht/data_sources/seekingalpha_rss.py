@@ -6,12 +6,19 @@ import logging
 import feedparser
 from typing import List, Dict
 from qaht.utils.validation import validate_ticker, ValidationError
+from qaht.utils.error_handling import handle_api_errors
+from qaht.core.production_optimizations import CircuitBreaker
 
 logger = logging.getLogger(__name__)
 
 class SeekingAlphaRSS:
     def __init__(self):
         self.base_url = "https://seekingalpha.com"
+        self.circuit_breaker = CircuitBreaker(
+            failure_threshold=3,
+            recovery_timeout=180,
+            expected_exception=Exception
+        )
         
     def get_market_news(self) -> List[Dict]:
         """Get latest market news"""
