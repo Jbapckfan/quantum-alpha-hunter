@@ -53,17 +53,37 @@ quantum-alpha-hunter/
 
 ## 🚀 Quick Start
 
-### Prerequisites
+### 🍎 MacBook Users (Easiest)
 
+```bash
+# 1. Clone the repository
+git clone https://github.com/Jbapckfan/quantum-alpha-hunter.git
+cd quantum-alpha-hunter
+
+# 2. Run automated setup (installs everything)
+bash setup_mac.sh
+
+# 3. See it in action
+python scripts/demo.py
+
+# 4. Read the Mac guide for next steps
+open MACOS_SETUP.md
+```
+
+**That's it!** See [MACOS_SETUP.md](MACOS_SETUP.md) for detailed instructions.
+
+### 🐧 Linux/Windows Setup
+
+**Prerequisites:**
 - Python 3.11+
 - SQLite (included with Python) or PostgreSQL
 - Reddit API credentials (free, get from [reddit.com/prefs/apps](https://www.reddit.com/prefs/apps))
 
-### Installation
+**Installation:**
 
 ```bash
 # Clone the repository
-git clone <your-repo-url>
+git clone https://github.com/Jbapckfan/quantum-alpha-hunter.git
 cd quantum-alpha-hunter
 
 # Create virtual environment
@@ -71,24 +91,28 @@ python3.11 -m venv venv
 source venv/bin/activate  # On Windows: venv\Scripts\activate
 
 # Install dependencies
-pip install -e ".[dev]"
+pip install pandas numpy scikit-learn yfinance praw SQLAlchemy \
+    python-dotenv tqdm requests plotly streamlit click
 
 # Copy environment template
 cp .env.example .env
 # Edit .env with your Reddit API credentials (required for social signals)
 
 # Initialize database
-qaht init
+python -c "from qaht.db import init_db; from qaht.config import load_config; init_db(load_config())"
 ```
 
-### First Run
+**First Run:**
 
 ```bash
-# Run the pipeline on the initial universe
-qaht run-pipeline
+# See the demo (no API needed)
+python scripts/demo.py
+
+# With real data (needs Reddit API)
+python scripts/run_full_pipeline.py
 
 # Launch the dashboard
-qaht dashboard
+streamlit run qaht/dashboard/app.py
 ```
 
 ---
