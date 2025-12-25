@@ -40,15 +40,38 @@ class Trade:
         self.hold_days: Optional[int] = None
         self.exit_reason: Optional[str] = None
 
-    def close(self, exit_date: str, exit_price: float, exit_reason: str):
-        """Close the trade"""
+    def close(self, exit_price: float, exit_reason: str, exit_date: str,
+              commission_pct: float = 0.001, slippage_pct: float = 0.0005):
+        """
+        Close the trade with realistic costs
+
+        Args:
+            exit_price: Raw exit price
+            exit_reason: Reason for exit
+            exit_date: Exit date
+            commission_pct: Commission (10 bps default)
+            slippage_pct: Slippage (5 bps default)
+        """
         self.exit_date = exit_date
         self.exit_price = exit_price
         self.exit_reason = exit_reason
 
-        # Calculate P&L
-        self.return_pct = (exit_price - self.entry_price) / self.entry_price
-        self.pnl = self.position_size * self.return_pct
+        # Calculate gross return
+        gross_return_pct = (exit_price - self.entry_price) / self.entry_price
+
+        # Apply entry costs
+        entry_cost = self.position_size * (commission_pct + slippage_pct)
+
+        # Apply exit costs
+        exit_cost = self.position_size * (1 + gross_return_pct) * (commission_pct + slippage_pct)
+
+        # Net P&L after costs
+        gross_pnl = self.position_size * gross_return_pct
+        total_costs = entry_cost + exit_cost
+        self.pnl = gross_pnl - total_costs
+
+        # Net return percentage
+        self.return_pct = self.pnl / self.position_size
 
         # Calculate hold time
         entry_dt = datetime.strptime(self.entry_date, "%Y-%m-%d")
@@ -143,7 +166,7 @@ def simulate(
                     session, trade, date, max_hold_days, profit_target, stop_loss
                 )
                 if exit_price:
-                    trade.close(date, exit_price, exit_reason)
+                    trade.close(exit_price, exit_reason, date)
                     capital += trade.position_size + trade.pnl
                     closed_trades.append(trade)
                     trades_to_close.append(trade)
@@ -201,7 +224,7 @@ def simulate(
         for trade in open_trades:
             exit_price = _get_exit_price(session, trade.symbol, end_date)
             if exit_price:
-                trade.close(end_date, exit_price, "end_of_backtest")
+                trade.close(exit_price, "end_of_backtest", end_date)
                 capital += trade.position_size + trade.pnl
                 closed_trades.append(trade)
 

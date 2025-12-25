@@ -112,15 +112,35 @@ def train_model(symbols: Optional[List[str]] = None, asset_type: str = 'stock') 
     # Target: forward return (continuous)
     y = df['fwd_ret_10d'].values
 
+    # CRITICAL: Weight samples to handle class imbalance
+    # Explosive events are rare - give them higher weight
+    y_binary = df['explosive_10d'].values.astype(int)
+    n_explosions = y_binary.sum()
+    n_normal = len(y_binary) - n_explosions
+
+    if n_explosions == 0:
+        logger.error("No explosions in training data - cannot train model")
+        return None
+
+    # Calculate sample weights (inverse frequency)
+    sample_weights = np.where(
+        y_binary == 1,
+        len(y_binary) / (2 * n_explosions),  # Upweight explosions
+        len(y_binary) / (2 * n_normal)        # Downweight normal
+    )
+
+    logger.info(f"Training with {n_explosions} explosions ({n_explosions/len(y_binary)*100:.1f}%) and {n_normal} normal samples")
+    logger.info(f"Sample weights - explosions: {sample_weights[y_binary==1][0]:.2f}, normal: {sample_weights[y_binary==0][0]:.2f}")
+
     # Build pipeline
     pipeline = Pipeline([
         ('scaler', StandardScaler()),
         ('ridge', RidgeCV(alphas=[0.1, 1.0, 10.0, 100.0], cv=config.scoring.cv_folds))
     ])
 
-    # Train
-    logger.info("Training Ridge model...")
-    pipeline.fit(X, y)
+    # Train with sample weights
+    logger.info("Training Ridge model with class balancing...")
+    pipeline.fit(X, y, ridge__sample_weight=sample_weights)
 
     # Get best alpha
     best_alpha = pipeline.named_steps['ridge'].alpha_
