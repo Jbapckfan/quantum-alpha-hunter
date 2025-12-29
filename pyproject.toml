@@ -23,6 +23,9 @@ dependencies = [
     "click>=8.0",
     "beautifulsoup4>=4.12",
     "lxml>=5.0",
+    "lightgbm>=4.0",
+    "xgboost>=2.0",
+    "pytrends>=4.9",
 ]
 
 [project.optional-dependencies]
