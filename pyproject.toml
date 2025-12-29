@@ -26,6 +26,7 @@ dependencies = [
     "lightgbm>=4.0",
     "xgboost>=2.0",
     "pytrends>=4.9",
+    "shap>=0.44",
 ]
 
 [project.optional-dependencies]
