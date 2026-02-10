@@ -10,7 +10,7 @@ from sqlalchemy import select
 
 from ..db import session_scope
 from ..schemas import Predictions, PriceOHLC, Labels
-from ..config import load_config
+from ..config import get_config
 
 logger = logging.getLogger("qaht.backtest.simulator")
 

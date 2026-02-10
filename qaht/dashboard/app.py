@@ -8,9 +8,14 @@ import plotly.graph_objects as go
 import plotly.express as px
 from datetime import datetime, timedelta
 import json
+import sys
+from pathlib import Path
 
-from ..db import session_scope
-from ..schemas import Predictions, Factors, Labels, PriceOHLC
+# Add parent directory to path for imports
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+
+from qaht.db import session_scope
+from qaht.schemas import Predictions, Factors, Labels, PriceOHLC
 from sqlalchemy import select, desc
 
 # Page config

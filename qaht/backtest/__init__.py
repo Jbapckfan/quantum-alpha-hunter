@@ -8,7 +8,7 @@ from .metrics import (
 )
 from .labeler import (
     label_explosions,
-    label_explosions_triple_barrier,
+    label_triple_barrier,
     get_explosion_stats
 )
 
@@ -19,6 +19,6 @@ __all__ = [
     'calculate_monthly_returns',
     'calculate_score_bucket_performance',
     'label_explosions',
-    'label_explosions_triple_barrier',
+    'label_triple_barrier',
     'get_explosion_stats'
 ]
