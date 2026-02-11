@@ -83,8 +83,9 @@ st.markdown("""
     section[data-testid="stSidebar"] { background-color: #111827; }
     .stApp header { background-color: transparent; }
 
-    /* Hide default Streamlit elements */
-    #MainMenu, footer, header[data-testid="stHeader"] { visibility: hidden; }
+    /* Hide default Streamlit elements (keep header for sidebar toggle) */
+    #MainMenu, footer { visibility: hidden; }
+    header[data-testid="stHeader"] { background-color: rgba(10,14,23,0.8) !important; }
 
     .main-title {
         font-family: 'Inter', sans-serif;
@@ -1796,15 +1797,15 @@ elif st.session_state.scan_results:
             else:
                 st.warning("Run a scan first to generate signals for backtesting.")
 
-# Default: show instructions
+# Default: show instructions + quick-start actions
 else:
     st.markdown("""
-    <div style="text-align:center;padding:80px 20px">
+    <div style="text-align:center;padding:60px 20px 20px">
         <div class="main-title" style="font-size:42px;margin-bottom:8px">ALPHA PREDATOR</div>
         <div style="color:#64748b;font-size:16px;margin-bottom:40px">
             Swing Reversal Scanner — Bottomed Stocks Reversing With Strength
         </div>
-        <div style="display:flex;justify-content:center;gap:40px;flex-wrap:wrap">
+        <div style="display:flex;justify-content:center;gap:40px;flex-wrap:wrap;margin-bottom:40px">
             <div style="text-align:center;max-width:220px">
                 <div style="font-size:36px;margin-bottom:8px">🔍</div>
                 <div style="color:#e2e8f0;font-weight:600;margin-bottom:4px">Search</div>
@@ -1823,3 +1824,41 @@ else:
         </div>
     </div>
     """, unsafe_allow_html=True)
+
+    # Quick-start: search bar right on the main page
+    st.markdown("---")
+    qs_cols = st.columns([1, 3, 1])
+    with qs_cols[1]:
+        st.markdown('<div style="text-align:center;color:#94a3b8;font-size:13px;margin-bottom:8px">Quick Search — or use the sidebar for full controls</div>', unsafe_allow_html=True)
+        qs_sym = st.text_input("Enter ticker(s)", placeholder="NVDA, TSLA, PLTR...", key="qs_input", label_visibility="collapsed")
+        qs_col1, qs_col2 = st.columns(2)
+        with qs_col1:
+            qs_analyze = st.button("Analyze Symbol", type="primary", use_container_width=True, key="qs_analyze")
+        with qs_col2:
+            qs_quick_scan = st.button("Quick Scan (High Beta)", use_container_width=True, key="qs_quick")
+
+    if qs_analyze and qs_sym.strip():
+        symbols = [s.strip().upper() for s in qs_sym.split(",") if s.strip()]
+        if len(symbols) == 1:
+            with st.spinner(f"Analyzing {symbols[0]}..."):
+                result = analyze_symbol(symbols[0], "1y")
+                if result:
+                    st.session_state.search_data = result
+                    st.session_state.selected_symbol = symbols[0]
+                    st.rerun()
+                else:
+                    st.error(f"Could not fetch data for {symbols[0]}.")
+        else:
+            with st.spinner(f"Scanning {len(symbols)} symbols..."):
+                results = analyze_batch(symbols, "1y")
+                st.session_state.scan_results = results
+                st.session_state.search_data = None
+                st.rerun()
+
+    if qs_quick_scan:
+        quick_universe = PRESETS["High Beta / Meme"]
+        with st.spinner(f"Scanning {len(quick_universe)} high-beta stocks..."):
+            results = analyze_batch(quick_universe, "1y")
+            st.session_state.scan_results = results
+            st.session_state.search_data = None
+            st.rerun()
