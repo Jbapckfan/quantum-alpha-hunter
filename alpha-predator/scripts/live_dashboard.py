@@ -1710,7 +1710,23 @@ with st.sidebar:
         vol_choice = st.selectbox("Min avg daily volume", list(vol_options.keys()), index=0)
         min_avg_vol = vol_options[vol_choice]
 
-        min_rev_score = st.slider("Min reversal score", 0, 80, 20)
+        min_rev_score = st.slider(
+            "Min reversal score", 0, 100, 0,
+            help="Filter results after scanning. Reversal scores range 0-100+. "
+                 "In Bottomed Reversals mode, baseline is 25. Drag higher to show only strongest setups.",
+        )
+
+        # Live count in sidebar so user sees filter effect immediately
+        if st.session_state.get("scan_results"):
+            _all = st.session_state.scan_results
+            _after_vol = [r for r in _all if r.get("avg_volume", 0) >= min_avg_vol] if min_avg_vol > 0 else _all
+            _after_rev = [r for r in _after_vol if r["reversal"]["reversal_score"] >= min_rev_score] if min_rev_score > 0 else _after_vol
+            _shown = len(_after_rev)
+            _total = len(_all)
+            if _shown < _total:
+                st.caption(f"Showing **{_shown}** of {_total} results")
+            else:
+                st.caption(f"**{_shown}** results")
 
     # ── Settings ──
     with st.expander("⚙️ Settings", expanded=False):
@@ -1840,13 +1856,24 @@ elif st.session_state.scan_results:
     if min_rev_score > 0:
         active_filters.append(f"Rev ≥ {min_rev_score}")
 
-    # Show filter effect — how many results are displayed vs total scanned
+    # Show filter effect — prominent bar so user sees filter is working
     filtered_count = len(results)
     if filtered_count < total_before_filters:
+        excluded = total_before_filters - filtered_count
         st.markdown(
-            f'<div style="margin-bottom:8px;color:#94a3b8;font-size:13px">'
-            f'Showing <strong style="color:#e2e8f0">{filtered_count}</strong> of '
-            f'{total_before_filters} results (filters applied)</div>',
+            f'<div style="background:rgba(168,85,247,0.1);border:1px solid rgba(168,85,247,0.3);'
+            f'border-radius:8px;padding:10px 16px;margin-bottom:12px;display:flex;'
+            f'justify-content:space-between;align-items:center">'
+            f'<span style="color:#e2e8f0;font-size:14px;font-weight:600">'
+            f'Showing {filtered_count} of {total_before_filters} results</span>'
+            f'<span style="color:#a855f7;font-size:12px">'
+            f'{excluded} hidden by filters</span></div>',
+            unsafe_allow_html=True,
+        )
+    elif results:
+        st.markdown(
+            f'<div style="color:#94a3b8;font-size:13px;margin-bottom:8px">'
+            f'{filtered_count} results</div>',
             unsafe_allow_html=True,
         )
 
@@ -1862,9 +1889,9 @@ elif st.session_state.scan_results:
         st.markdown(f"""
         <div style="display:flex;gap:16px;margin-bottom:20px;flex-wrap:wrap">
             <div class="metric-card red" style="flex:1;min-width:140px">
-                <div class="metric-label">Reversals Found</div>
+                <div class="metric-label">Reversals Shown</div>
                 <div class="metric-value" style="color:#ef4444">{len(results)}</div>
-                <div class="metric-detail">DD≥15% + RSI<55 + confirmation</div>
+                <div class="metric-detail">{f'{total_before_filters} scanned, {total_before_filters - len(results)} filtered out' if len(results) < total_before_filters else f'{total_before_filters} total'}</div>
             </div>
             <div class="metric-card green" style="flex:1;min-width:140px">
                 <div class="metric-label">Combo Confirmed</div>
@@ -1887,8 +1914,9 @@ elif st.session_state.scan_results:
         st.markdown(f"""
         <div style="display:flex;gap:16px;margin-bottom:20px;flex-wrap:wrap">
             <div class="metric-card blue" style="flex:1;min-width:140px">
-                <div class="metric-label">Candidates</div>
+                <div class="metric-label">Candidates Shown</div>
                 <div class="metric-value" style="color:#3b82f6">{len(results)}</div>
+                <div class="metric-detail">{f'{total_before_filters} scanned, {total_before_filters - len(results)} filtered out' if len(results) < total_before_filters else f'{total_before_filters} total'}</div>
             </div>
             <div class="metric-card green" style="flex:1;min-width:140px">
                 <div class="metric-label">Combo Confirmed</div>
