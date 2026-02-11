@@ -14,7 +14,7 @@ from apredator.scoring.combo_matcher import match_combos
 from apredator.scoring.tier_system import compute_setup_score
 from apredator.scoring.position_sizer import kelly_position_size
 
-DEMO_SYMBOLS = ["AMC", "GME", "SOFI", "PLTR", "RIOT"]
+DEMO_SYMBOLS = ["AMC", "GME", "SOFI", "RIOT", "HOOD"]
 
 
 def main():

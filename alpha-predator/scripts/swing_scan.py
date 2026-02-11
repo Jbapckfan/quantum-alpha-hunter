@@ -28,11 +28,11 @@ UNIVERSE = [
     # Chinese ADR
     "BABA", "JD", "PDD", "NIO", "XPEV", "LI", "BIDU", "FUTU", "TAL",
     # Meme / High-beta
-    "AMC", "GME", "BBBY", "SOFI", "HOOD", "AFRM", "UPST", "DKNG", "PLTR",
+    "AMC", "GME", "BBBY", "SOFI", "HOOD", "AFRM", "UPST", "DKNG",
     "CLOV", "WISH", "SKLZ", "OPEN", "RBLX", "U", "SNOW", "CRWD", "NET",
     "DDOG", "ZS", "MDB", "CFLT",
     # Tech growth / Semis
-    "NVDA", "AMD", "TSLA", "SQ", "SHOP", "ROKU", "TTD", "PINS", "SNAP",
+    "AMD", "SQ", "SHOP", "ROKU", "TTD", "PINS", "SNAP",
     "LYFT", "UBER", "ABNB", "DASH", "SE", "GRAB", "CPNG",
     # Misc high-beta
     "SMCI", "IONQ", "RGTI", "QBTS", "QUBT", "ARQQ", "LUNR", "RKLB",

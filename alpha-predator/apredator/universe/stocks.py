@@ -1,13 +1,11 @@
 """
 Stock universe builder.
-Combines S&P 500, NASDAQ 100, and curated sector lists into a deduplicated
-tradable universe. Sourced from Hedge Fund master_system.py.
+Combines curated momentum, sector, and high-interest lists into a deduplicated
+tradable universe.  No S&P 500 / NASDAQ-100 mega-caps — this app targets
+small-to-mid-cap momentum names.
 """
 import logging
-import re
 from typing import List, Optional
-
-import pandas as pd
 
 from ..config import get_config
 
@@ -23,94 +21,60 @@ SECTOR_LISTS = {
     "crypto_related": ["RIOT", "MARA", "COIN", "BITF", "HUT", "CIFR"],
     "cannabis": ["TLRY", "SNDL", "ACB", "CGC", "HEXO"],
     "chinese_adr": ["BABA", "JD", "PDD", "NIO", "XPEV", "LI", "BIDU"],
-    "tech_growth": ["PLTR", "SOFI", "HOOD", "AFRM", "UPST", "DKNG"],
+    "tech_growth": ["SOFI", "HOOD", "AFRM", "UPST", "DKNG", "HIMS"],
 }
 
-# Hardcoded fallback in case Wikipedia scraping fails
-_FALLBACK_SP500 = [
-    "AAPL", "MSFT", "AMZN", "NVDA", "GOOGL", "META", "TSLA", "BRK.B",
-    "UNH", "XOM", "JNJ", "JPM", "V", "PG", "AVGO", "HD", "MA", "CVX",
-    "MRK", "ABBV", "LLY", "PEP", "COST", "KO", "ADBE", "WMT", "MCD",
-    "CRM", "CSCO", "TMO", "ACN", "ABT", "DHR", "LIN", "NKE", "CMCSA",
-    "VZ", "TXN", "NEE", "PM", "BMY", "UNP", "ORCL", "RTX", "INTC",
-    "AMD", "QCOM", "HON", "LOW", "COP", "AMGN",
-]
-
-_FALLBACK_NASDAQ100 = [
-    "AAPL", "MSFT", "AMZN", "NVDA", "GOOGL", "META", "TSLA", "AVGO",
-    "ADBE", "COST", "PEP", "CSCO", "CMCSA", "INTC", "AMD", "TXN",
-    "QCOM", "AMGN", "INTU", "NFLX", "HON", "SBUX", "ISRG", "AMAT",
-    "BKNG", "GILD", "ADP", "MDLZ", "ADI", "VRTX", "REGN", "LRCX",
-    "PYPL", "MU", "PANW", "SNPS", "KLAC", "CDNS", "MELI", "CHTR",
-    "ABNB", "MAR", "MNST", "FTNT", "CRWD", "KDP", "CTAS", "AEP",
-    "DXCM", "ORLY",
-]
-
-
 # ---------------------------------------------------------------------------
-# Wikipedia scrapers
+# Momentum / high-interest stocks (the core universe)
 # ---------------------------------------------------------------------------
-
-def get_sp500() -> List[str]:
-    """Scrape S&P 500 constituents from Wikipedia.
-
-    Falls back to a hardcoded list of top-50 symbols on failure.
-    """
-    try:
-        url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-        tables = pd.read_html(url)
-        df = tables[0]
-        symbols = df["Symbol"].str.strip().str.replace(".", "-", regex=False).tolist()
-        logger.info(f"Scraped {len(symbols)} S&P 500 symbols from Wikipedia")
-        return symbols
-    except Exception as exc:
-        logger.warning(f"Failed to scrape S&P 500 from Wikipedia: {exc}. Using fallback list.")
-        return list(_FALLBACK_SP500)
-
-
-def get_nasdaq100() -> List[str]:
-    """Scrape NASDAQ-100 constituents from Wikipedia.
-
-    Falls back to a hardcoded list of top-50 symbols on failure.
-    """
-    try:
-        url = "https://en.wikipedia.org/wiki/Nasdaq-100"
-        tables = pd.read_html(url)
-        # The constituents table usually contains a 'Ticker' or 'Symbol' column
-        for table in tables:
-            for col in ("Ticker", "Symbol"):
-                if col in table.columns:
-                    symbols = table[col].str.strip().tolist()
-                    logger.info(f"Scraped {len(symbols)} NASDAQ-100 symbols from Wikipedia")
-                    return symbols
-        # If we reach here, none of the tables had the expected column
-        logger.warning("Could not find Ticker/Symbol column in NASDAQ-100 Wikipedia tables. Using fallback.")
-        return list(_FALLBACK_NASDAQ100)
-    except Exception as exc:
-        logger.warning(f"Failed to scrape NASDAQ-100 from Wikipedia: {exc}. Using fallback list.")
-        return list(_FALLBACK_NASDAQ100)
+_FALLBACK_MOMENTUM = [
+    # Meme / High Beta
+    "AMC", "GME", "SOFI", "HOOD", "AFRM", "UPST", "DKNG", "CLOV", "RBLX", "CVNA",
+    "HIMS", "DJT", "RDDT", "MNDY", "CELH", "SNAP", "PINS", "SE", "GRAB",
+    # Crypto-Adjacent
+    "RIOT", "MARA", "COIN", "BITF", "HUT", "CIFR", "MSTR", "CLSK",
+    # Biotech
+    "SAVA", "SRNE", "OCGN", "VXRT", "IBRX", "APLS", "CRSP", "BEAM", "NTLA", "DNA",
+    "IONS", "EXAS", "FATE", "EDIT", "FOLD", "DAWN",
+    # EV / Clean Energy
+    "LCID", "RIVN", "QS", "CHPT", "BLNK", "PLUG", "FCEL", "BE", "RUN", "STEM",
+    "GOEV", "WKHS", "NKLA", "PTRA", "EVGO",
+    # Tech Growth
+    "SNOW", "NET", "DDOG", "ZS", "MDB", "CFLT", "SHOP", "ROKU", "TTD", "TWLO",
+    "DOCN", "BILL", "PCOR", "TOST", "BRZE",
+    # Chinese ADR
+    "BABA", "JD", "PDD", "NIO", "XPEV", "LI", "BIDU", "FUTU", "TAL", "BILI",
+    # Quantum / Space / AI
+    "IONQ", "RGTI", "QBTS", "QUBT", "LUNR", "RKLB", "ASTS", "JOBY", "SMCI", "ARM",
+    "AI", "BBAI", "SOUN", "VNET",
+    # Nuclear / Energy
+    "OKLO", "SMR", "NNE", "VST", "CEG", "CCJ", "LEU",
+    # Cannabis
+    "TLRY", "SNDL", "ACB", "CGC",
+    # Misc Momentum / Popular
+    "BARK", "WULF", "SQ", "OPEN", "WISH", "SKLZ",
+    "INDI", "LAZR", "LIDR", "VLDR", "OUST", "AEVA",
+    # Mid-cap value / under-followed
+    "CROX", "DINO", "TGTX", "RXRX", "SMMT", "ACHR", "GENI", "BTBT",
+    # SPACs / De-SPACs that are actively traded
+    "MVST", "PAYO", "OPAD", "IRNT", "VLD",
+]
 
 
 # ---------------------------------------------------------------------------
 # Filters
 # ---------------------------------------------------------------------------
 
-_EXCLUDED_SUFFIX_RE = re.compile(r"[WUR]$")
-
-
 def _is_tradable(symbol: str) -> bool:
     """Return True if the symbol looks like a regular equity ticker.
 
     Excludes warrants (W), units (U), and rights (R) that are suffixed to
-    tickers on exchanges.
+    tickers on exchanges (e.g. "ACAHW", "BRPMU", "IRNTR").
+    Short tickers like "W" (Wayfair) or "U" (Unity) are kept.
     """
     if not symbol or not isinstance(symbol, str):
         return False
     sym = symbol.strip().upper()
-    if _EXCLUDED_SUFFIX_RE.search(sym) and len(sym) > 1:
-        return True  # single-char check below
-    # More precise: exclude if the last character is W, U, or R and it looks
-    # like a multi-part ticker (e.g., "ACAHW")
     if len(sym) >= 4 and sym[-1] in ("W", "U", "R"):
         return False
     return True
@@ -121,14 +85,15 @@ def _is_tradable(symbol: str) -> bool:
 # ---------------------------------------------------------------------------
 
 def get_stock_universe(config=None) -> List[str]:
-    """Build the full stock universe by combining index constituents and
-    curated sector lists.
+    """Build the full stock universe from curated momentum + sector lists.
+
+    No S&P 500 / NASDAQ-100 mega-caps — this app focuses on small-to-mid-cap
+    momentum names.
 
     Parameters
     ----------
     config : ConfigManager, optional
-        If provided, additional filtering criteria (max_price, min_volume, etc.)
-        can be applied downstream. Currently only used for logging context.
+        If provided, additional symbols from a config universe file are merged in.
 
     Returns
     -------
@@ -137,11 +102,8 @@ def get_stock_universe(config=None) -> List[str]:
     """
     all_symbols: set = set()
 
-    # 1. Index constituents
-    sp500 = get_sp500()
-    nasdaq100 = get_nasdaq100()
-    all_symbols.update(sp500)
-    all_symbols.update(nasdaq100)
+    # 1. Momentum / high-interest stocks (core universe)
+    all_symbols.update(_FALLBACK_MOMENTUM)
 
     # 2. Curated sector lists
     for sector_name, tickers in SECTOR_LISTS.items():

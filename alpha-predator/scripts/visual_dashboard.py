@@ -18,7 +18,7 @@ from apredator.scoring.position_sizer import kelly_position_size
 
 TOP_SYMBOLS = [
     "HOOD", "DDOG", "MNDY", "MARA", "SNAP", "RDDT", "QS", "HIMS",
-    "SOFI", "RBLX", "SHOP", "FUTU", "SE", "PLTR", "SNOW", "ZS",
+    "SOFI", "RBLX", "SHOP", "FUTU", "SE", "SNOW", "ZS", "CVNA",
     "MSTR", "DASH", "TLRY", "RIVN", "OPEN",
 ]
 

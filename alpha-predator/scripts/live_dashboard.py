@@ -39,6 +39,11 @@ from apredator.features.analogs import find_historical_analogs
 from apredator.features.fibonacci import compute_fibonacci_levels
 from apredator.features.finra import fetch_short_interest, compute_dark_pool_proxy
 from apredator.features.watchlist import Watchlist
+from apredator.features.divergence import compute_divergences
+from apredator.features.volume_profile import compute_volume_profile
+from apredator.features.max_pain import compute_max_pain_gex
+from apredator.features.multi_timeframe import compute_multi_timeframe_score
+from apredator.features.edgar_insider import fetch_edgar_insider
 from apredator.backtest.equity_curve import simulate_equity_curve, build_equity_chart
 
 # Signal tracker & watchlist (persistent across reruns)
@@ -59,7 +64,7 @@ st.set_page_config(
 # Preset universes
 # ─────────────────────────────────────────────────────────────────────────────
 PRESETS = {
-    "High Beta / Meme": ["AMC", "GME", "SOFI", "HOOD", "AFRM", "UPST", "DKNG", "PLTR", "CLOV", "RBLX"],
+    "High Beta / Meme": ["AMC", "GME", "SOFI", "HOOD", "AFRM", "UPST", "DKNG", "CLOV", "RBLX", "CVNA"],
     "Crypto-Adjacent": ["RIOT", "MARA", "COIN", "BITF", "HUT", "CIFR", "MSTR", "CLSK"],
     "Biotech": ["SAVA", "SRNE", "OCGN", "VXRT", "IBRX", "APLS", "CRSP", "BEAM", "NTLA", "DNA"],
     "EV / Clean Energy": ["LCID", "RIVN", "QS", "CHPT", "BLNK", "PLUG", "FCEL", "BE", "ENPH", "RUN"],
@@ -277,7 +282,7 @@ def compute_support_resistance(df, n_levels=4):
     return sorted(final, key=lambda l: l["price"])
 
 
-def compute_reversal_metrics(tech, explosive, df):
+def compute_reversal_metrics(tech, explosive, df, divergence=None):
     """Compute reversal strength score and reasons."""
     close = df["close"].iloc[-1]
     close_5d = df["close"].iloc[-6] if len(df) > 5 else close
@@ -325,6 +330,16 @@ def compute_reversal_metrics(tech, explosive, df):
     if tech.get("bb_width_pct", 10) < 5:
         score += 8; reasons.append(f"BB squeeze {tech.get('bb_width_pct',0):.1f}%")
 
+    # Divergence boost
+    if divergence and divergence.get("has_bullish_div"):
+        strength = divergence.get("divergence_strength", 0)
+        if strength >= 3:
+            score += 20; reasons.append(f"Strong bullish divergence ({divergence.get('divergence_type', '')})")
+        elif strength >= 2:
+            score += 16; reasons.append(f"Bullish divergence ({divergence.get('divergence_type', '')})")
+        else:
+            score += 12; reasons.append(f"Mild bullish divergence ({divergence.get('divergence_type', '')})")
+
     return {
         "reversal_score": score, "reasons": reasons,
         "ret_5d": ret_5d, "ret_20d": ret_20d, "rsi": rsi,
@@ -333,14 +348,11 @@ def compute_reversal_metrics(tech, explosive, df):
 
 
 @st.cache_data(ttl=3600, show_spinner="Fetching full US market from NASDAQ...")
-def fetch_full_market(min_mcap=0, max_mcap=0, min_vol=0):
-    """Fetch ALL US-traded stocks from NASDAQ screener API and pre-filter.
+def fetch_full_market(min_mcap=0, max_mcap=0):
+    """Fetch ALL US-traded stocks from NASDAQ screener API, filtered by market cap.
 
-    Returns a list of symbol strings that pass the market cap filter.
-    Volume filtering is done downstream via yfinance since NASDAQ screener
-    doesn't provide avg volume.
-
-    Covers NYSE + NASDAQ + AMEX — the entire US equity market (~7000+ stocks).
+    Volume filtering is done downstream in analyze_batch using actual OHLCV data
+    because the NASDAQ API does not return a volume field.
     """
     url = "https://api.nasdaq.com/api/screener/stocks"
     params = {"tableType": "traded", "limit": 25000, "offset": 0}
@@ -372,17 +384,17 @@ def fetch_full_market(min_mcap=0, max_mcap=0, min_vol=0):
         if len(symbol) >= 5 and symbol[-1] in ("W", "U", "R"):
             continue
 
-        # Parse market cap — comes as raw number string like "4,594,401,000,000"
+        # Parse market cap
         mc_str = row.get("marketCap", "")
         mc = _parse_mcap(mc_str)
 
-        # Apply market cap filters (0 = no filter; unknown/0 mcap passes)
-        if min_mcap > 0 and mc > 0 and mc < min_mcap:
+        # If mcap filter is active, stock must meet it (unknown mcap = excluded)
+        if min_mcap > 0 and mc < min_mcap:
             continue
-        if max_mcap > 0 and mc > 0 and mc > max_mcap:
+        if max_mcap > 0 and (mc == 0 or mc > max_mcap):
             continue
 
-        # Skip completely empty entries (no market cap at all = likely shell/dead)
+        # Skip completely empty entries
         if mc == 0 and not row.get("lastsale"):
             continue
 
@@ -461,7 +473,13 @@ def analyze_symbol(symbol, period="1y"):
     explosive = compute_all_explosive(sym_df)
     combos = match_combos(explosive)
     levels = compute_support_resistance(sym_df)
-    reversal = compute_reversal_metrics(tech, explosive, sym_df)
+
+    # New computation-only features
+    divergence = compute_divergences(sym_df)
+    vol_profile = compute_volume_profile(sym_df)
+    mtf = compute_multi_timeframe_score(sym_df)
+
+    reversal = compute_reversal_metrics(tech, explosive, sym_df, divergence=divergence)
     weekly = compute_weekly_confluence(sym_df)
     gaps = detect_unfilled_gaps(sym_df)
 
@@ -478,11 +496,22 @@ def analyze_symbol(symbol, period="1y"):
     # Per-symbol intelligence (only for single-symbol view, too slow for batch)
     sector = get_symbol_sector(symbol)
     rel_strength = compute_relative_strength(sym_df, sector=sector)
-    insider = fetch_insider_activity(symbol)
+    edgar_insider = fetch_edgar_insider(symbol)
+    # Backward-compatible insider dict
+    insider = {
+        "insider_buys": edgar_insider.get("insider_buys_90d", 0),
+        "insider_sells": edgar_insider.get("insider_sells_90d", 0),
+        "insider_net": edgar_insider.get("insider_net_90d", 0),
+        "insider_buy_value": 0,
+        "last_insider_buy": None,
+    }
     options = detect_unusual_options(symbol)
     earnings = get_earnings_proximity(symbol)
 
-    # New features: analogs, fibonacci, short interest, dark pool
+    # Max pain & GEX (single-symbol only, requires API call)
+    max_pain = compute_max_pain_gex(symbol, float(sym_df["close"].iloc[-1]))
+
+    # Existing features: analogs, fibonacci, short interest, dark pool
     current_features = {
         "drawdown_60d": explosive.get("drawdown_60d", 0),
         "rsi_14": tech.get("rsi_14", 50),
@@ -506,6 +535,8 @@ def analyze_symbol(symbol, period="1y"):
         "options": options, "earnings": earnings,
         "analogs": analogs, "fibonacci": fib,
         "short_info": short_info, "dark_pool": dark_pool,
+        "max_pain": max_pain, "divergence": divergence,
+        "vol_profile": vol_profile, "edgar_insider": edgar_insider, "mtf": mtf,
     }
 
 
@@ -515,43 +546,66 @@ def fetch_batch(symbols, period="1y"):
     return fetch_prices(symbols, period=period)
 
 
-def analyze_batch(symbols, period="1y", min_mcap=0, max_mcap=0, min_vol=0):
-    """Analyze multiple symbols efficiently with market cap and volume filtering."""
-    df_all = fetch_batch(symbols, period)
+def filter_by_volume(df_all, symbols, min_vol):
+    """Filter symbols by 20-day avg daily volume using downloaded OHLCV data.
+
+    Returns the filtered symbol list.
+    """
+    if min_vol <= 0:
+        return symbols
+    if df_all.empty or "symbol" not in df_all.columns:
+        return []
+
+    valid = [s for s in symbols if s in df_all["symbol"].unique()]
+    passing = []
+    for sym in valid:
+        sym_vol = df_all.loc[df_all["symbol"] == sym, "volume"]
+        avg_vol = float(sym_vol.tail(20).mean()) if len(sym_vol) >= 20 else float(sym_vol.mean())
+        if avg_vol >= min_vol:
+            passing.append(sym)
+    return passing
+
+
+def analyze_batch(symbols, df_all, min_mcap=0, max_mcap=0):
+    """Analyze symbols that have already been price-downloaded and volume-filtered."""
     if df_all.empty:
         return []
 
-    # Fetch fundamentals for all symbols at once
     valid_symbols = [s for s in symbols if s in df_all["symbol"].unique()]
-    fundies = fetch_fundamentals_batch(valid_symbols)
 
-    # Pre-filter by market cap and volume before heavy computation
-    filtered_symbols = []
-    for symbol in valid_symbols:
-        fund = fundies.get(symbol, {"market_cap": 0, "avg_volume": 0})
-        mc = fund["market_cap"]
-        av = fund["avg_volume"]
-
-        # Apply filters (0 = no filter / unknown passes)
-        if min_mcap > 0 and mc > 0 and mc < min_mcap:
-            continue
-        if max_mcap > 0 and mc > 0 and mc > max_mcap:
-            continue
-        if min_vol > 0 and av > 0 and av < min_vol:
-            continue
-        filtered_symbols.append(symbol)
+    # ── Pre-filter by market cap (only if mcap filters are active) ──
+    needs_mcap = min_mcap > 0 or max_mcap > 0
+    if needs_mcap:
+        fundies = fetch_fundamentals_batch(valid_symbols)
+        filtered_symbols = []
+        for symbol in valid_symbols:
+            mc = fundies.get(symbol, {}).get("market_cap", 0)
+            if min_mcap > 0 and mc < min_mcap:
+                continue
+            if max_mcap > 0 and (mc == 0 or mc > max_mcap):
+                continue
+            filtered_symbols.append(symbol)
+    else:
+        fundies = {}
+        filtered_symbols = valid_symbols
 
     results = []
-    for symbol in filtered_symbols:
+    progress = st.progress(0, text=f"Analyzing 0/{len(filtered_symbols)} symbols...")
+    for idx, symbol in enumerate(filtered_symbols):
         sym_df = df_all[df_all["symbol"] == symbol].sort_values("date").reset_index(drop=True)
         if len(sym_df) < 60:
+            progress.progress((idx + 1) / len(filtered_symbols),
+                              text=f"Analyzing {idx+1}/{len(filtered_symbols)}... ({symbol} skipped)")
             continue
         try:
             tech = compute_all_technical(sym_df)
             explosive = compute_all_explosive(sym_df)
             combos = match_combos(explosive)
             levels = compute_support_resistance(sym_df)
-            reversal = compute_reversal_metrics(tech, explosive, sym_df)
+            divergence = compute_divergences(sym_df)
+            vol_profile = compute_volume_profile(sym_df)
+            mtf = compute_multi_timeframe_score(sym_df)
+            reversal = compute_reversal_metrics(tech, explosive, sym_df, divergence=divergence)
             weekly = compute_weekly_confluence(sym_df)
             gaps = detect_unfilled_gaps(sym_df)
             best_combo = max(combos, key=lambda c: c["hit_rate"]) if combos else None
@@ -559,7 +613,9 @@ def analyze_batch(symbols, period="1y", min_mcap=0, max_mcap=0, min_vol=0):
             feat_dict = {**tech, **explosive, "close": sym_df["close"].iloc[-1]}
             tier_result = classify_tier(feat_dict)
 
-            fund = fundies.get(symbol, {"market_cap": 0, "avg_volume": 0})
+            fund = fundies.get(symbol, {})
+            # Compute avg volume from actual OHLCV data (always reliable)
+            sym_avg_vol = float(sym_df["volume"].tail(20).mean()) if len(sym_df) >= 20 else float(sym_df["volume"].mean())
 
             # Log signal to tracker
             _tracker.log_signal(
@@ -577,12 +633,17 @@ def analyze_batch(symbols, period="1y", min_mcap=0, max_mcap=0, min_vol=0):
                 "combos": combos, "levels": levels, "reversal": reversal,
                 "best_combo": best_combo, "kelly": kelly, "tier": tier_result,
                 "price": float(sym_df["close"].iloc[-1]),
-                "market_cap": fund["market_cap"],
-                "avg_volume": fund["avg_volume"],
+                "market_cap": fund.get("market_cap", 0),
+                "avg_volume": sym_avg_vol,
                 "weekly": weekly, "gaps": gaps,
+                "divergence": divergence, "vol_profile": vol_profile, "mtf": mtf,
             })
         except Exception:
             pass
+
+        progress.progress((idx + 1) / len(filtered_symbols),
+                          text=f"Analyzing {idx+1}/{len(filtered_symbols)}... ({symbol})")
+    progress.empty()
 
     results.sort(key=lambda r: (len(r["combos"]) > 0, r["reversal"]["reversal_score"]), reverse=True)
     return results
@@ -639,189 +700,233 @@ def filter_bottomed_reversals(results):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def build_price_chart(data, days=120):
-    """Build a polished interactive candlestick chart with S/R levels, VWAP, and overlays."""
+    """Build a polished chart matching the Key Resistance Levels Analysis style.
+
+    Features:
+    - Close line with high-low range ribbon (gray shaded)
+    - MA20 (blue dashed) and MA50 (orange dashed)
+    - Color-graded resistance levels (red → orange → yellow) with R1-Rn labels
+    - Green current price line with left-side label
+    - 52-week high dotted line
+    - Red/green volume bars
+    - New feature overlays (Max Pain, VPOC, Value Area, divergence arrows)
+    """
     df = data["df"].tail(days).copy()
     levels = data["levels"]
     current_price = data["price"]
     symbol = data["symbol"]
 
     fig = make_subplots(
-        rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.02,
-        row_heights=[0.78, 0.22],
+        rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.04,
+        row_heights=[0.75, 0.25],
+        subplot_titles=[None, None],
     )
 
-    # ── Candlestick ──
-    fig.add_trace(go.Candlestick(
-        x=df["date"], open=df["open"], high=df["high"], low=df["low"], close=df["close"],
-        increasing_line_color="#22c55e", decreasing_line_color="#ef4444",
-        increasing_fillcolor="rgba(34,197,94,0.85)", decreasing_fillcolor="rgba(239,68,68,0.85)",
-        increasing_line_width=1, decreasing_line_width=1,
-        name=symbol, showlegend=False,
+    # ── High-Low Range ribbon (gray shaded band) ──
+    fig.add_trace(go.Scatter(
+        x=df["date"], y=df["high"], mode="lines",
+        line=dict(color="rgba(180,180,180,0)", width=0),
+        name="Range", showlegend=True, legendgroup="range",
+    ), row=1, col=1)
+    fig.add_trace(go.Scatter(
+        x=df["date"], y=df["low"], mode="lines", fill="tonexty",
+        fillcolor="rgba(180,180,180,0.25)",
+        line=dict(color="rgba(180,180,180,0)", width=0),
+        name="Range", showlegend=False, legendgroup="range",
     ), row=1, col=1)
 
-    # ── Bollinger Bands (shaded ribbon) ──
+    # ── Close line (solid black/white) ──
+    fig.add_trace(go.Scatter(
+        x=df["date"], y=df["close"], mode="lines",
+        line=dict(color="#e2e8f0", width=2.2),
+        name="Close",
+    ), row=1, col=1)
+
+    # ── Moving averages (dashed) ──
     ma20 = df["close"].rolling(20).mean()
-    std20 = df["close"].rolling(20).std()
-    bb_upper = ma20 + 2 * std20
-    bb_lower = ma20 - 2 * std20
-    fig.add_trace(go.Scatter(
-        x=df["date"], y=bb_upper, mode="lines",
-        line=dict(color="rgba(59,130,246,0.2)", width=1), name="BB Upper", showlegend=False,
-    ), row=1, col=1)
-    fig.add_trace(go.Scatter(
-        x=df["date"], y=bb_lower, mode="lines", fill="tonexty",
-        fillcolor="rgba(59,130,246,0.04)",
-        line=dict(color="rgba(59,130,246,0.2)", width=1), name="BB Lower", showlegend=False,
-    ), row=1, col=1)
-
-    # ── Moving averages ──
     fig.add_trace(go.Scatter(
         x=df["date"], y=ma20, mode="lines",
-        line=dict(color="#f59e0b", width=1.5), name="MA 20",
+        line=dict(color="#6366f1", width=1.5, dash="dash"), name="MA20",
     ), row=1, col=1)
     ma50 = df["close"].rolling(50).mean()
     fig.add_trace(go.Scatter(
         x=df["date"], y=ma50, mode="lines",
-        line=dict(color="#a855f7", width=1.5), name="MA 50",
-    ), row=1, col=1)
-    if len(df) >= 200:
-        ma200 = df["close"].rolling(200).mean()
-        fig.add_trace(go.Scatter(
-            x=df["date"], y=ma200, mode="lines",
-            line=dict(color="#06b6d4", width=1.5), name="MA 200",
-        ), row=1, col=1)
-
-    # ── VWAP ──
-    typical_price = (df["high"] + df["low"] + df["close"]) / 3
-    cumvol = df["volume"].cumsum()
-    cumtp = (typical_price * df["volume"]).cumsum()
-    vwap = cumtp / cumvol.replace(0, np.nan)
-    fig.add_trace(go.Scatter(
-        x=df["date"], y=vwap, mode="lines",
-        line=dict(color="rgba(236,72,153,0.6)", width=1.5, dash="dot"), name="VWAP",
+        line=dict(color="#f59e0b", width=1.5, dash="dash"), name="MA50",
     ), row=1, col=1)
 
-    # ── S/R levels (pivot-based and MA-based) ──
-    for level in levels:
-        is_ma = level["type"].startswith("MA")
-        is_resistance = level["type"] == "resistance"
-
-        if is_ma:
-            color = "rgba(168,85,247,0.45)"
-            dash = "dot"
-            width = 1
-            label = level["type"]
-        elif is_resistance:
-            color = "rgba(239,68,68,0.55)"
-            dash = "dash"
-            width = 1.5
-            touches = level.get("touches", 0)
-            label = f"R ${level['price']:.2f}" + (f" ({touches}x)" if touches > 1 else "")
-        else:
-            color = "rgba(34,197,94,0.55)"
-            dash = "dash"
-            width = 1.5
-            touches = level.get("touches", 0)
-            label = f"S ${level['price']:.2f}" + (f" ({touches}x)" if touches > 1 else "")
-
-        fig.add_hline(
-            y=level["price"], line_dash=dash, line_color=color, line_width=width,
-            row=1, col=1,
-            annotation_text=f"  {label}",
-            annotation_position="right",
-            annotation_font=dict(size=10, color=color, family="Inter, sans-serif"),
-        )
-
-    # ── Fibonacci retracement levels ──
-    fib = data.get("fibonacci")
-    if fib and fib.get("levels"):
-        fib_colors = {
-            "23.6%": "rgba(255,215,0,0.4)",
-            "38.2%": "rgba(255,165,0,0.45)",
-            "50%": "rgba(0,191,255,0.45)",
-            "61.8%": "rgba(255,165,0,0.45)",
-            "78.6%": "rgba(255,215,0,0.4)",
-        }
-        for lvl in fib.get("levels", []):
-            label = lvl["level"]
-            if label in ("0%", "100%"):
-                continue  # skip swing high/low lines (already shown as S/R)
-            color = fib_colors.get(label, "rgba(255,215,0,0.35)")
-            fig.add_hline(
-                y=lvl["price"], line_dash="dot", line_color=color, line_width=1,
-                row=1, col=1,
-                annotation_text=f"  Fib {label}",
-                annotation_position="left",
-                annotation_font=dict(size=9, color=color, family="Inter, sans-serif"),
-            )
-
-    # ── Unfilled gaps (shaded zones) ──
-    for gap in data.get("gaps", []):
-        is_support = "support" in gap["type"]
-        fig.add_hrect(
-            y0=gap["bottom"], y1=gap["top"],
-            fillcolor="rgba(34,197,94,0.08)" if is_support else "rgba(239,68,68,0.08)",
-            line=dict(width=0),
-            row=1, col=1,
-            annotation_text=f"  Gap {gap['gap_pct']}%",
-            annotation_position="top right" if not is_support else "bottom right",
-            annotation_font=dict(
-                size=9, family="Inter, sans-serif",
-                color="rgba(34,197,94,0.6)" if is_support else "rgba(239,68,68,0.6)",
-            ),
-        )
-
-    # ── Current price line ──
+    # ── 52-Week High (dotted magenta line) ──
+    full_df = data["df"]
+    high_52w = float(full_df["high"].tail(252).max()) if len(full_df) >= 20 else float(full_df["high"].max())
     fig.add_hline(
-        y=current_price, line_dash="solid", line_color="rgba(255,255,255,0.35)",
-        line_width=1, row=1, col=1,
-        annotation_text=f"  ${current_price:.2f}",
+        y=high_52w, line_dash="dot", line_color="rgba(200,120,220,0.5)", line_width=1,
+        row=1, col=1,
+        annotation_text=f"52w High: ${high_52w:.2f}",
         annotation_position="right",
-        annotation_font=dict(size=11, color="#e2e8f0", family="SF Mono, Fira Code, monospace"),
+        annotation_font=dict(size=10, color="rgba(200,120,220,0.8)", family="Inter, sans-serif"),
     )
 
-    # ── Volume bars (color-coded) ──
+    # ── S/R levels — color-graded resistance/support with R1-Rn / S1-Sn labels ──
+    # Separate resistances and supports, sort by distance from current price
+    resistances = sorted(
+        [l for l in levels if l["type"] == "resistance" and l["price"] > current_price],
+        key=lambda l: l["price"],
+    )
+    supports = sorted(
+        [l for l in levels if l["type"] == "support" and l["price"] <= current_price],
+        key=lambda l: l["price"], reverse=True,
+    )
+
+    # De-cluster: skip levels within 1.5% of the previous kept level
+    def _decluster(lvls, min_gap_pct=1.5):
+        kept = []
+        for lv in lvls:
+            if kept and abs(lv["price"] / kept[-1]["price"] - 1) * 100 < min_gap_pct:
+                continue
+            kept.append(lv)
+        return kept
+
+    resistances = _decluster(resistances)
+    supports = _decluster(supports)
+
+    # Color gradient for resistances (cap at 4)
+    _r_colors = [
+        ("#ef4444", 2.0),   # R1 — red
+        ("#f97316", 1.5),   # R2 — orange
+        ("#f59e0b", 1.2),   # R3 — amber
+        ("#eab308", 1.0),   # R4 — yellow
+    ]
+    for i, level in enumerate(resistances[:4]):
+        color, width = _r_colors[i] if i < len(_r_colors) else ("#eab308", 1.0)
+        pct = (level["price"] / current_price - 1) * 100
+        label = f"R{i+1} ${level['price']:.2f} +{pct:.0f}%"
+        fig.add_hline(
+            y=level["price"], line_dash="dash", line_color=color, line_width=width,
+            row=1, col=1,
+            annotation_text=f"  {label}",
+            annotation_position="right" if i % 2 == 0 else "left",
+            annotation_font=dict(size=9, color=color, family="Inter, sans-serif"),
+        )
+
+    # Supports: green shades (cap at 2)
+    _s_colors = [
+        ("#22c55e", 1.5),   # S1 — green
+        ("#4ade80", 1.2),   # S2
+    ]
+    for i, level in enumerate(supports[:2]):
+        color, width = _s_colors[i] if i < len(_s_colors) else ("#86efac", 1.0)
+        pct = (level["price"] / current_price - 1) * 100
+        label = f"S{i+1} ${level['price']:.2f} {pct:.0f}%"
+        fig.add_hline(
+            y=level["price"], line_dash="dash", line_color=color, line_width=width,
+            row=1, col=1,
+            annotation_text=f"  {label}",
+            annotation_position="right" if i % 2 == 1 else "left",
+            annotation_font=dict(size=9, color=color, family="Inter, sans-serif"),
+        )
+
+    # ── Current price line (green solid, label on left) ──
+    fig.add_hline(
+        y=current_price, line_dash="solid", line_color="#22c55e", line_width=2,
+        row=1, col=1,
+        annotation_text=f"Current: ${current_price:.2f}  ",
+        annotation_position="left",
+        annotation_font=dict(size=11, color="#fbbf24", family="Inter, sans-serif"),
+    )
+
+    # ── Max Pain line (magenta dashed) ──
+    max_pain = data.get("max_pain")
+    if max_pain and max_pain.get("max_pain_price"):
+        fig.add_hline(
+            y=max_pain["max_pain_price"], line_dash="dash",
+            line_color="rgba(236,72,153,0.7)", line_width=1.5, row=1, col=1,
+            annotation_text=f"  Max Pain ${max_pain['max_pain_price']:.2f}",
+            annotation_position="left",
+            annotation_font=dict(size=9, color="rgba(236,72,153,0.8)", family="Inter, sans-serif"),
+        )
+
+    # ── Volume Profile: VPOC line + Value Area zone ──
+    vp = data.get("vol_profile")
+    if vp and vp.get("vpoc_price"):
+        fig.add_hline(
+            y=vp["vpoc_price"], line_dash="solid",
+            line_color="rgba(255,255,255,0.45)", line_width=1.5, row=1, col=1,
+            annotation_text=f"  VPOC ${vp['vpoc_price']:.2f}",
+            annotation_position="left",
+            annotation_font=dict(size=9, color="rgba(255,255,255,0.6)", family="Inter, sans-serif"),
+        )
+        if vp.get("value_area_high") and vp.get("value_area_low"):
+            fig.add_hrect(
+                y0=vp["value_area_low"], y1=vp["value_area_high"],
+                fillcolor="rgba(59,130,246,0.06)",
+                line=dict(width=0), row=1, col=1,
+            )
+
+    # ── Divergence annotations (arrows at pivots) ──
+    div_data = data.get("divergence")
+    if div_data and div_data.get("divergences"):
+        for d in div_data["divergences"]:
+            bar_idx = d.get("bar_index")
+            if bar_idx is not None and 0 <= bar_idx < len(df):
+                row_data = df.iloc[bar_idx]
+                is_bullish = "bullish" in d.get("type", "").lower()
+                fig.add_annotation(
+                    x=row_data["date"],
+                    y=float(row_data["low"]) * 0.995 if is_bullish else float(row_data["high"]) * 1.005,
+                    text="Div",
+                    showarrow=True,
+                    arrowhead=2, arrowsize=1.2, arrowwidth=2,
+                    arrowcolor="#22c55e" if is_bullish else "#ef4444",
+                    ay=30 if is_bullish else -30,
+                    font=dict(size=9, color="#22c55e" if is_bullish else "#ef4444", family="Inter"),
+                    row=1, col=1,
+                )
+
+    # ── Volume bars (red/green, no MA overlay) ──
     vol_colors = [
-        "rgba(34,197,94,0.5)" if c >= o else "rgba(239,68,68,0.5)"
+        "#22c55e" if c >= o else "#ef4444"
         for c, o in zip(df["close"], df["open"])
     ]
     fig.add_trace(go.Bar(
         x=df["date"], y=df["volume"], marker_color=vol_colors,
-        name="Volume", showlegend=False,
-    ), row=2, col=1)
-    vol_ma = df["volume"].rolling(20).mean()
-    fig.add_trace(go.Scatter(
-        x=df["date"], y=vol_ma, mode="lines",
-        line=dict(color="#f59e0b", width=1.5), name="Vol MA20", showlegend=False,
+        marker_line_width=0, name="Volume", showlegend=False,
     ), row=2, col=1)
 
     # ── Layout ──
     fig.update_layout(
+        title=dict(
+            text=f"{symbol} — Key Resistance Levels Analysis",
+            font=dict(size=16, family="Inter, sans-serif", color="#e2e8f0"),
+            x=0.5, xanchor="center",
+        ),
         template="plotly_dark",
         paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="#080c14",
-        height=600, margin=dict(l=0, r=90, t=30, b=10),
+        height=640, margin=dict(l=60, r=160, t=50, b=40),
         xaxis_rangeslider_visible=False,
         legend=dict(
             font=dict(size=11, family="Inter, sans-serif", color="#94a3b8"),
-            bgcolor="rgba(0,0,0,0)", x=0.01, y=0.99,
-            orientation="h", yanchor="top",
+            bgcolor="rgba(17,24,39,0.8)", bordercolor="rgba(30,41,59,0.5)", borderwidth=1,
+            x=0.01, y=0.99, yanchor="top",
         ),
         yaxis=dict(
-            gridcolor="rgba(30,41,59,0.5)", side="right", zeroline=False,
-            tickfont=dict(size=10, color="#64748b", family="SF Mono, monospace"),
+            title=dict(text="Price ($)", font=dict(size=12, color="#94a3b8", family="Inter")),
+            gridcolor="rgba(30,41,59,0.4)", side="left", zeroline=False,
+            tickfont=dict(size=10, color="#94a3b8", family="SF Mono, monospace"),
+            tickprefix="$",
         ),
         yaxis2=dict(
-            gridcolor="rgba(30,41,59,0.3)", side="right", zeroline=False,
-            tickfont=dict(size=9, color="#475569", family="SF Mono, monospace"),
+            title=dict(text="Volume (M)", font=dict(size=11, color="#94a3b8", family="Inter")),
+            gridcolor="rgba(30,41,59,0.2)", side="left", zeroline=False,
+            tickfont=dict(size=9, color="#64748b", family="SF Mono, monospace"),
             showgrid=False,
         ),
         xaxis=dict(
             gridcolor="rgba(30,41,59,0.3)", zeroline=False,
-            tickfont=dict(size=10, color="#475569"),
+            tickfont=dict(size=10, color="#64748b"),
         ),
         xaxis2=dict(
+            title=dict(text="Date", font=dict(size=11, color="#94a3b8", family="Inter")),
             gridcolor="rgba(30,41,59,0.3)", zeroline=False,
-            tickfont=dict(size=9, color="#475569"),
+            tickfont=dict(size=10, color="#64748b"),
         ),
         hoverlabel=dict(
             bgcolor="#1e293b", bordercolor="#334155",
@@ -1068,9 +1173,27 @@ def render_symbol_detail(data):
                     <div class="metric-value" style="color:#64748b;font-size:14px">Scan for detail</div>
                 </div>""", unsafe_allow_html=True)
 
-        # Insider activity
+        # Insider activity (EDGAR-enhanced when available)
         with intel_cols[2]:
-            if insider:
+            edgar = data.get("edgar_insider")
+            if edgar and (edgar.get("insider_buys_90d", 0) > 0 or edgar.get("insider_sells_90d", 0) > 0):
+                sentiment = edgar.get("insider_sentiment", "Neutral")
+                net = edgar.get("insider_net_90d", 0)
+                buys = edgar.get("insider_buys_90d", 0)
+                sells = edgar.get("insider_sells_90d", 0)
+                source = edgar.get("data_source", "EDGAR")
+                if "Buy" in sentiment:
+                    ins_color, card_c = "#22c55e", "green"
+                elif sentiment == "Sell":
+                    ins_color, card_c = "#ef4444", "red"
+                else:
+                    ins_color, card_c = "#f59e0b", "amber"
+                st.markdown(f"""<div class="metric-card {card_c}">
+                    <div class="metric-label">Insider ({source})</div>
+                    <div class="metric-value" style="font-size:16px;color:{ins_color}">{sentiment}</div>
+                    <div class="metric-detail">{buys} buys / {sells} sells | Net {net:+d}</div>
+                </div>""", unsafe_allow_html=True)
+            elif insider:
                 net = insider.get("insider_net", 0)
                 buys = insider.get("insider_buys", 0)
                 sells = insider.get("insider_sells", 0)
@@ -1154,6 +1277,183 @@ def render_symbol_detail(data):
 
         # ── Advanced Intelligence: Short Interest, Dark Pool, Analogs, Fib ──
         render_advanced_intel(data)
+
+        # ── New features: Max Pain, Divergence, Volume Profile, MTF, EDGAR ──
+        render_new_features(data)
+
+
+def render_new_features(data):
+    """Render new feature cards: Max Pain/GEX, Divergence, Volume Profile, Multi-TF Score, EDGAR insider."""
+    max_pain = data.get("max_pain")
+    div_data = data.get("divergence")
+    vp = data.get("vol_profile")
+    mtf = data.get("mtf")
+    edgar = data.get("edgar_insider")
+
+    has_any = max_pain or div_data or vp or mtf or edgar
+    if not has_any:
+        return
+
+    st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
+
+    # Row of 4 metric cards
+    nf_cols = st.columns(4)
+
+    # Max Pain / GEX
+    with nf_cols[0]:
+        if max_pain and max_pain.get("max_pain_price"):
+            mp = max_pain["max_pain_price"]
+            dist = max_pain.get("max_pain_distance_pct", 0)
+            gex_sig = max_pain.get("gex_signal", "N/A")
+            gex_color = "#22c55e" if gex_sig == "Mean-Reverting" else ("#ef4444" if gex_sig == "Trending" else "#64748b")
+            card_c = "green" if gex_sig == "Mean-Reverting" else ("red" if gex_sig == "Trending" else "blue")
+            st.markdown(f"""<div class="metric-card {card_c}">
+                <div class="metric-label">Max Pain / GEX</div>
+                <div class="metric-value" style="font-size:16px;color:{gex_color}">${mp:.2f}</div>
+                <div class="metric-detail">{dist:+.1f}% away | GEX: {gex_sig}</div>
+            </div>""", unsafe_allow_html=True)
+        else:
+            st.markdown("""<div class="metric-card blue">
+                <div class="metric-label">Max Pain / GEX</div>
+                <div class="metric-value" style="color:#64748b;font-size:14px">N/A</div>
+            </div>""", unsafe_allow_html=True)
+
+    # Divergence
+    with nf_cols[1]:
+        if div_data:
+            dtype = div_data.get("divergence_type", "None")
+            strength = div_data.get("divergence_strength", 0)
+            bars = div_data.get("divergence_bars_ago")
+            has_bull = div_data.get("has_bullish_div", False)
+            has_bear = div_data.get("has_bearish_div", False)
+            if has_bull:
+                d_color, card_c = "#22c55e", "green"
+            elif has_bear:
+                d_color, card_c = "#ef4444", "red"
+            else:
+                d_color, card_c = "#64748b", "blue"
+            bars_text = f" | {bars} bars ago" if bars else ""
+            st.markdown(f"""<div class="metric-card {card_c}">
+                <div class="metric-label">Divergence</div>
+                <div class="metric-value" style="font-size:14px;color:{d_color}">{dtype}</div>
+                <div class="metric-detail">Strength: {strength}/3{bars_text}</div>
+            </div>""", unsafe_allow_html=True)
+        else:
+            st.markdown("""<div class="metric-card blue">
+                <div class="metric-label">Divergence</div>
+                <div class="metric-value" style="color:#64748b;font-size:14px">None</div>
+            </div>""", unsafe_allow_html=True)
+
+    # Volume Profile
+    with nf_cols[2]:
+        if vp and vp.get("vpoc_price"):
+            vpoc = vp["vpoc_price"]
+            pos = vp.get("price_vs_value_area", "unknown")
+            dist = vp.get("vpoc_distance_pct", 0)
+            pos_color = "#22c55e" if pos == "below" else ("#ef4444" if pos == "above" else "#3b82f6")
+            card_c = "green" if pos == "below" else ("red" if pos == "above" else "blue")
+            st.markdown(f"""<div class="metric-card {card_c}">
+                <div class="metric-label">Volume Profile</div>
+                <div class="metric-value" style="font-size:16px;color:{pos_color}">VPOC ${vpoc:.2f}</div>
+                <div class="metric-detail">{dist:+.1f}% | Price {pos} value area</div>
+            </div>""", unsafe_allow_html=True)
+        else:
+            st.markdown("""<div class="metric-card blue">
+                <div class="metric-label">Volume Profile</div>
+                <div class="metric-value" style="color:#64748b;font-size:14px">N/A</div>
+            </div>""", unsafe_allow_html=True)
+
+    # Multi-TF Score
+    with nf_cols[3]:
+        if mtf:
+            score = mtf.get("mtf_score", 50)
+            signal = mtf.get("mtf_signal", "Neutral")
+            alignment = mtf.get("tf_alignment", 0)
+            sig_color = "#22c55e" if "Bull" in signal else ("#ef4444" if "Bear" in signal else "#f59e0b")
+            card_c = "green" if "Bull" in signal else ("red" if "Bear" in signal else "amber")
+            st.markdown(f"""<div class="metric-card {card_c}">
+                <div class="metric-label">Multi-TF Score</div>
+                <div class="metric-value" style="font-size:18px;color:{sig_color}">{score:.0f}</div>
+                <div class="metric-detail">{signal} | {alignment}/3 aligned</div>
+            </div>""", unsafe_allow_html=True)
+        else:
+            st.markdown("""<div class="metric-card blue">
+                <div class="metric-label">Multi-TF Score</div>
+                <div class="metric-value" style="color:#64748b;font-size:14px">N/A</div>
+            </div>""", unsafe_allow_html=True)
+
+    # EDGAR Insider expander
+    if edgar and (edgar.get("insider_buys_90d", 0) > 0 or edgar.get("insider_sells_90d", 0) > 0):
+        sentiment = edgar.get("insider_sentiment", "Neutral")
+        score = edgar.get("insider_score", 0)
+        cluster = edgar.get("cluster_buying", False)
+        source = edgar.get("data_source", "EDGAR")
+        with st.expander(f"EDGAR Insider Transactions — {sentiment} (score: {score}, source: {source})", expanded=False):
+            ecols = st.columns(4)
+            with ecols[0]:
+                st.markdown(f"""<div class="metric-card green" style="padding:10px 14px">
+                    <div class="metric-label">Buys (90d)</div>
+                    <div class="metric-value" style="font-size:20px;color:#22c55e">{edgar.get('insider_buys_90d', 0)}</div>
+                </div>""", unsafe_allow_html=True)
+            with ecols[1]:
+                st.markdown(f"""<div class="metric-card red" style="padding:10px 14px">
+                    <div class="metric-label">Sells (90d)</div>
+                    <div class="metric-value" style="font-size:20px;color:#ef4444">{edgar.get('insider_sells_90d', 0)}</div>
+                </div>""", unsafe_allow_html=True)
+            with ecols[2]:
+                net = edgar.get("insider_net_90d", 0)
+                net_color = "#22c55e" if net > 0 else ("#ef4444" if net < 0 else "#64748b")
+                st.markdown(f"""<div class="metric-card {'green' if net>0 else 'red' if net<0 else 'blue'}" style="padding:10px 14px">
+                    <div class="metric-label">Net</div>
+                    <div class="metric-value" style="font-size:20px;color:{net_color}">{net:+d}</div>
+                </div>""", unsafe_allow_html=True)
+            with ecols[3]:
+                st.markdown(f"""<div class="metric-card {'green' if cluster else 'blue'}" style="padding:10px 14px">
+                    <div class="metric-label">Cluster Buying</div>
+                    <div class="metric-value" style="font-size:18px;color:{'#22c55e' if cluster else '#64748b'}">{'YES' if cluster else 'No'}</div>
+                </div>""", unsafe_allow_html=True)
+
+            filings = edgar.get("recent_filings", [])
+            if filings:
+                filing_rows = []
+                for f in filings[:10]:
+                    filing_rows.append({
+                        "Date": f.get("filing_date", ""),
+                        "Title": f.get("title", "")[:80],
+                        "Link": f.get("link", ""),
+                    })
+                st.dataframe(pd.DataFrame(filing_rows), use_container_width=True, hide_index=True)
+
+    # Volume profile detail expander
+    if vp and vp.get("volume_profile"):
+        with st.expander("Volume Profile Detail", expanded=False):
+            vp_rows = []
+            for level in vp["volume_profile"]:
+                vp_rows.append({
+                    "Price": f"${level['price_level']:.2f}",
+                    "Volume": f"{level['volume']:,.0f}",
+                })
+            if vp_rows:
+                st.dataframe(pd.DataFrame(vp_rows), use_container_width=True, hide_index=True)
+
+    # MTF detail expander
+    if mtf and mtf.get("daily_detail"):
+        with st.expander("Multi-Timeframe Detail", expanded=False):
+            mtf_rows = []
+            for tf_name, detail_key in [("Daily", "daily_detail"), ("Weekly", "weekly_detail"), ("Monthly", "monthly_detail")]:
+                d = mtf.get(detail_key, {})
+                if d:
+                    mtf_rows.append({
+                        "Timeframe": tf_name,
+                        "Bias": d.get("bias", "?").title(),
+                        "RSI": f"{d.get('rsi', 0):.1f}",
+                        "MACD Bull": "Yes" if d.get("macd_bullish") else "No",
+                        "Above MA20": "Yes" if d.get("above_ma20") else "No",
+                        "Higher Lows": "Yes" if d.get("higher_lows") else "No",
+                        "Score": f"{d.get('score', 0)}/4",
+                    })
+            if mtf_rows:
+                st.dataframe(pd.DataFrame(mtf_rows), use_container_width=True, hide_index=True)
 
 
 def render_advanced_intel(data):
@@ -1329,6 +1629,9 @@ def render_scan_results_table(results):
             "Best Combo": r["best_combo"]["name"] if r["best_combo"] else "—",
             "Hit Rate": f"{r['best_combo']['hit_rate']*100:.1f}%" if r["best_combo"] else "—",
             "Gaps": len(r.get("gaps", [])),
+            "Div": r.get("divergence", {}).get("divergence_type", "None"),
+            "VPOC": r.get("vol_profile", {}).get("price_vs_value_area", "—"),
+            "MTF": round(r.get("mtf", {}).get("mtf_score", 0)),
             "Signals": ", ".join(rev["reasons"][:3]),
         })
 
@@ -1349,7 +1652,7 @@ with st.sidebar:
     # Search
     search_input = st.text_input(
         "🔍 Symbol Search",
-        placeholder="AAPL, TSLA, NVDA...",
+        placeholder="SOFI, RIOT, IONQ...",
         help="Enter one or more ticker symbols separated by commas",
     )
     search_btn = st.button("Analyze", type="primary", use_container_width=True)
@@ -1369,25 +1672,16 @@ with st.sidebar:
     # Universe scanner
     preset_keys = list(PRESETS.keys())
     preset_name = st.selectbox("🌐 Universe", preset_keys, index=preset_keys.index("Full Market (All US Stocks)"))
-    scan_btn = st.button(
-        "🔥 Find Reversals" if scan_mode == "Bottomed Reversals" else "Scan Universe",
-        type="primary" if scan_mode == "Bottomed Reversals" else "secondary",
-        use_container_width=True,
-    )
 
-    st.markdown("---")
-
-    # ── Collapsible Filters ──
+    # ── Filters (above the scan button so they take effect) ──
     with st.expander("📏 Filters", expanded=False):
         mcap_options = {
             "No filter": (0, 0),
-            "Below $200B": (0, 200_000_000_000),
             "Nano (<$50M)": (0, 50_000_000),
             "Micro ($50M–$300M)": (50_000_000, 300_000_000),
             "Small ($300M–$2B)": (300_000_000, 2_000_000_000),
-            "Mid ($2B–$10B)": (2_000_000_000, 10_000_000_000),
-            "Large ($10B–$200B)": (10_000_000_000, 200_000_000_000),
-            "Mega (>$200B)": (200_000_000_000, 0),
+            "$100M–$100B": (100_000_000, 100_000_000_000),
+            "$200M–$250B": (200_000_000, 250_000_000_000),
             "Custom range": None,
         }
         mcap_choice = st.selectbox("Market cap", list(mcap_options.keys()), index=0)
@@ -1418,10 +1712,16 @@ with st.sidebar:
 
         min_rev_score = st.slider("Min reversal score", 0, 80, 20)
 
-    # ── Collapsible Settings ──
+    # ── Settings ──
     with st.expander("⚙️ Settings", expanded=False):
         chart_days = st.slider("Chart days", 30, 252, 120)
         period = st.selectbox("Data period", ["6mo", "1y", "2y"], index=1)
+
+    scan_btn = st.button(
+        "🔥 Find Reversals" if scan_mode == "Bottomed Reversals" else "Scan Universe",
+        type="primary" if scan_mode == "Bottomed Reversals" else "secondary",
+        use_container_width=True,
+    )
 
     st.markdown("---")
     st.markdown(
@@ -1444,6 +1744,8 @@ if "search_data" not in st.session_state:
     st.session_state.search_data = None
 if "scan_mode" not in st.session_state:
     st.session_state.scan_mode = "All Signals"
+if "scan_performed" not in st.session_state:
+    st.session_state.scan_performed = False
 
 # Handle search
 if search_btn and search_input.strip():
@@ -1457,39 +1759,43 @@ if search_btn and search_input.strip():
             else:
                 st.error(f"Could not fetch data for {symbols[0]}. Check the ticker symbol.")
     else:
-        with st.spinner(f"Scanning {len(symbols)} symbols..."):
-            results = analyze_batch(symbols, period, min_mcap=min_mcap, max_mcap=max_mcap, min_vol=min_avg_vol)
+        with st.spinner(f"Downloading prices for {len(symbols)} symbols..."):
+            df_all = fetch_batch(symbols, period)
+        filtered = filter_by_volume(df_all, symbols, min_avg_vol)
+        st.toast(f"Analyzing {len(filtered)} symbols" + (f" ({len(symbols) - len(filtered)} excluded by vol filter)" if min_avg_vol > 0 else ""))
+        with st.spinner(f"Analyzing {len(filtered)} symbols..."):
+            results = analyze_batch(filtered, df_all, min_mcap=min_mcap, max_mcap=max_mcap)
             if scan_mode == "Bottomed Reversals":
                 results = filter_bottomed_reversals(results)
             st.session_state.scan_results = results
             st.session_state.scan_mode = scan_mode
             st.session_state.search_data = None
+            st.session_state.scan_performed = True
 
 # Handle preset scan
 if scan_btn:
     if preset_name == "Full Market (All US Stocks)":
-        # Fetch the ENTIRE US equity market, pre-filtered by mcap at screener level
-        symbols = fetch_full_market(min_mcap=min_mcap, max_mcap=max_mcap, min_vol=0)
-        st.toast(f"Universe: {len(symbols)} stocks pass market cap filter")
+        symbols = fetch_full_market(min_mcap=min_mcap, max_mcap=max_mcap)
     else:
         symbols = PRESETS[preset_name]
 
-    spinner_msg = (f"Hunting bottomed reversals across {len(symbols)} stocks..."
-                   if scan_mode == "Bottomed Reversals"
-                   else f"Scanning {len(symbols)} symbols from '{preset_name}'...")
+    with st.spinner(f"Downloading prices for {len(symbols)} stocks..."):
+        df_all = fetch_batch(symbols, period)
 
-    with st.spinner(spinner_msg):
-        # For Full Market, mcap already filtered at screener level — only pass volume filter
-        if preset_name == "Full Market (All US Stocks)":
-            results = analyze_batch(symbols, period, min_mcap=0, max_mcap=0, min_vol=min_avg_vol)
-        else:
-            results = analyze_batch(symbols, period, min_mcap=min_mcap, max_mcap=max_mcap, min_vol=min_avg_vol)
-        results = [r for r in results if r["reversal"]["reversal_score"] >= min_rev_score]
+    # Volume filter — runs BEFORE analysis so the count is accurate
+    filtered = filter_by_volume(df_all, symbols, min_avg_vol)
+    if min_avg_vol > 0:
+        st.toast(f"Volume filter: {len(symbols)} → {len(filtered)} stocks (≥{format_volume(min_avg_vol)} avg daily)")
+
+    action = "Hunting reversals" if scan_mode == "Bottomed Reversals" else "Analyzing"
+    with st.spinner(f"{action} across {len(filtered)} stocks..."):
+        results = analyze_batch(filtered, df_all, min_mcap=0, max_mcap=0)
         if scan_mode == "Bottomed Reversals":
             results = filter_bottomed_reversals(results)
         st.session_state.scan_results = results
         st.session_state.scan_mode = scan_mode
         st.session_state.search_data = None
+        st.session_state.scan_performed = True
 
 # ── Render content ──
 
@@ -1506,7 +1812,18 @@ if st.session_state.search_data:
 
 # If we have scan results
 elif st.session_state.scan_results:
+    total_before_filters = len(st.session_state.scan_results)
     results = st.session_state.scan_results
+
+    # ── Live post-filters (applied on every rerun so changing dropdowns works) ──
+    # Volume and reversal score can always be post-filtered (data is in the results).
+    # Market cap post-filter only works if market_cap was fetched — for Full Market scans
+    # it's already filtered at the NASDAQ API level and not stored per-result.
+    if min_avg_vol > 0:
+        results = [r for r in results if r.get("avg_volume", 0) >= min_avg_vol]
+    if min_rev_score > 0:
+        results = [r for r in results if r["reversal"]["reversal_score"] >= min_rev_score]
+
     combo_confirmed = [r for r in results if len(r["combos"]) > 0]
     is_reversal_mode = st.session_state.get("scan_mode") == "Bottomed Reversals"
 
@@ -1522,6 +1839,16 @@ elif st.session_state.scan_results:
         active_filters.append(f"Vol ≥ {format_volume(min_avg_vol)}")
     if min_rev_score > 0:
         active_filters.append(f"Rev ≥ {min_rev_score}")
+
+    # Show filter effect — how many results are displayed vs total scanned
+    filtered_count = len(results)
+    if filtered_count < total_before_filters:
+        st.markdown(
+            f'<div style="margin-bottom:8px;color:#94a3b8;font-size:13px">'
+            f'Showing <strong style="color:#e2e8f0">{filtered_count}</strong> of '
+            f'{total_before_filters} results (filters applied)</div>',
+            unsafe_allow_html=True,
+        )
 
     if active_filters:
         filter_tags = " ".join(f'<span class="signal-tag {"green" if f == "Bottomed Reversals" else "purple"}">{f}</span>' for f in active_filters)
@@ -1594,11 +1921,14 @@ elif st.session_state.scan_results:
         )
 
     # Symbol selector for detail view
-    st.markdown("---")
-    symbol_names = [r["symbol"] for r in results]
-    selected = st.selectbox("Select symbol for detailed analysis", symbol_names, index=0)
+    if results:
+        st.markdown("---")
+        symbol_names = [r["symbol"] for r in results]
+        selected = st.selectbox("Select symbol for detailed analysis", symbol_names, index=0)
 
-    selected_data = next((r for r in results if r["symbol"] == selected), None)
+        selected_data = next((r for r in results if r["symbol"] == selected), None)
+    else:
+        selected_data = None
     if selected_data:
         st.markdown(f"""
         <div style="display:flex;align-items:baseline;gap:16px;margin-bottom:20px">
@@ -1673,7 +2003,7 @@ elif st.session_state.scan_results:
             # Quick add
             wl_add_cols = st.columns([2, 1, 1, 1])
             with wl_add_cols[0]:
-                wl_sym = st.text_input("Symbol", placeholder="AAPL", key="wl_add_sym")
+                wl_sym = st.text_input("Symbol", placeholder="SOFI", key="wl_add_sym")
             with wl_add_cols[1]:
                 wl_target = st.number_input("Target $", min_value=0.0, value=0.0, step=1.0, key="wl_target")
             with wl_add_cols[2]:
@@ -1797,6 +2127,9 @@ elif st.session_state.scan_results:
             else:
                 st.warning("Run a scan first to generate signals for backtesting.")
 
+elif st.session_state.get("scan_performed") and not st.session_state.scan_results:
+    st.warning("No results found. Try broadening your filters (lower min reversal score, lower volume threshold, or wider market cap range).")
+
 # Default: show instructions + quick-start actions
 else:
     st.markdown("""
@@ -1830,7 +2163,7 @@ else:
     qs_cols = st.columns([1, 3, 1])
     with qs_cols[1]:
         st.markdown('<div style="text-align:center;color:#94a3b8;font-size:13px;margin-bottom:8px">Quick Search — or use the sidebar for full controls</div>', unsafe_allow_html=True)
-        qs_sym = st.text_input("Enter ticker(s)", placeholder="NVDA, TSLA, PLTR...", key="qs_input", label_visibility="collapsed")
+        qs_sym = st.text_input("Enter ticker(s)", placeholder="SOFI, RIOT, IONQ...", key="qs_input", label_visibility="collapsed")
         qs_col1, qs_col2 = st.columns(2)
         with qs_col1:
             qs_analyze = st.button("Analyze Symbol", type="primary", use_container_width=True, key="qs_analyze")
@@ -1849,16 +2182,21 @@ else:
                 else:
                     st.error(f"Could not fetch data for {symbols[0]}.")
         else:
-            with st.spinner(f"Scanning {len(symbols)} symbols..."):
-                results = analyze_batch(symbols, "1y")
+            with st.spinner(f"Downloading prices for {len(symbols)} symbols..."):
+                df_all = fetch_batch(symbols, "1y")
+            with st.spinner(f"Analyzing {len(symbols)} symbols..."):
+                results = analyze_batch(symbols, df_all)
                 st.session_state.scan_results = results
                 st.session_state.search_data = None
+                st.session_state.scan_performed = True
                 st.rerun()
 
     if qs_quick_scan:
         quick_universe = PRESETS["High Beta / Meme"]
         with st.spinner(f"Scanning {len(quick_universe)} high-beta stocks..."):
-            results = analyze_batch(quick_universe, "1y")
+            df_all = fetch_batch(quick_universe, "1y")
+            results = analyze_batch(quick_universe, df_all)
             st.session_state.scan_results = results
             st.session_state.search_data = None
+            st.session_state.scan_performed = True
             st.rerun()

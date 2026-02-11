@@ -10,6 +10,13 @@ from typing import Dict, List, Optional, Union
 import pandas as pd
 import yfinance as yf
 
+# Disable multitasking's thread-spawning — old yfinance ignores threads=False
+try:
+    import multitasking
+    multitasking.set_max_threads(1)
+except ImportError:
+    pass
+
 from ..db import session_scope
 from ..schemas import PriceOHLC
 from ..utils.retry import retry_with_backoff
@@ -54,51 +61,55 @@ def fetch_prices(
 
     logger.info(f"Downloading prices for {len(symbols)} symbols (period={period}, interval={interval})")
 
-    data = yf.download(
-        tickers=symbols,
-        period=period,
-        interval=interval,
-        group_by="ticker",
-        auto_adjust=True,
-        threads=True,
-        progress=False,
-    )
-
-    if data.empty:
-        logger.warning("yfinance returned empty DataFrame")
-        return pd.DataFrame()
-
+    # Download in batches of 20 to avoid thread-limit crashes
+    BATCH = 20
     frames: List[pd.DataFrame] = []
 
-    if len(symbols) == 1:
-        # Single ticker: columns are just Open, High, Low, Close, Volume
-        sym = symbols[0]
-        df = data.copy()
-        df = df.reset_index()
-        df.columns = [c.lower() if isinstance(c, str) else c for c in df.columns]
-        df["symbol"] = sym
-        df = df.rename(columns={"date": "date"})
-        # Keep only the columns we need
-        for col in ("open", "high", "low", "close", "volume"):
-            if col not in df.columns:
-                df[col] = None
-        frames.append(df[["symbol", "date", "open", "high", "low", "close", "volume"]])
-    else:
-        # Multi-ticker: MultiIndex columns (ticker, field)
-        for sym in symbols:
-            try:
-                sym_data = data[sym].copy()
-                sym_data = sym_data.reset_index()
-                sym_data.columns = [c.lower() if isinstance(c, str) else c for c in sym_data.columns]
-                sym_data["symbol"] = sym
-                for col in ("open", "high", "low", "close", "volume"):
-                    if col not in sym_data.columns:
-                        sym_data[col] = None
-                frames.append(sym_data[["symbol", "date", "open", "high", "low", "close", "volume"]])
-            except (KeyError, TypeError) as exc:
-                logger.warning(f"No data for {sym}: {exc}")
+    for i in range(0, len(symbols), BATCH):
+        batch = symbols[i : i + BATCH]
+        logger.debug(f"Batch {i // BATCH + 1}: downloading {len(batch)} symbols")
+
+        try:
+            data = yf.download(
+                tickers=batch,
+                period=period,
+                interval=interval,
+                group_by="ticker",
+                auto_adjust=True,
+                threads=False,
+                progress=False,
+            )
+        except Exception as exc:
+            logger.warning(f"Batch download failed for {batch[:3]}…: {exc}")
+            continue
+
+        if data.empty:
+            continue
+
+        if len(batch) == 1:
+            sym = batch[0]
+            df = data.copy().reset_index()
+            df.columns = [c.lower() if isinstance(c, str) else c for c in df.columns]
+            df["symbol"] = sym
+            for col in ("open", "high", "low", "close", "volume"):
+                if col not in df.columns:
+                    df[col] = None
+            frames.append(df[["symbol", "date", "open", "high", "low", "close", "volume"]])
+        else:
+            for sym in batch:
+                try:
+                    sym_data = data[sym].copy().reset_index()
+                    sym_data.columns = [c.lower() if isinstance(c, str) else c for c in sym_data.columns]
+                    sym_data["symbol"] = sym
+                    for col in ("open", "high", "low", "close", "volume"):
+                        if col not in sym_data.columns:
+                            sym_data[col] = None
+                    frames.append(sym_data[["symbol", "date", "open", "high", "low", "close", "volume"]])
+                except (KeyError, TypeError) as exc:
+                    logger.warning(f"No data for {sym}: {exc}")
 
     if not frames:
+        logger.warning("All batches returned empty — no price data")
         return pd.DataFrame()
 
     result = pd.concat(frames, ignore_index=True)
