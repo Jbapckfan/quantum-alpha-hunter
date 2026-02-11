@@ -81,6 +81,13 @@ def get_symbol_sector(symbol):
         return "Unknown"
 
 
+def get_sector_from_info(info):
+    """Extract sector from a pre-fetched ``ticker.info`` dict."""
+    if not info:
+        return "Unknown"
+    return info.get("sector", "Unknown")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 1. Relative Strength vs Sector & SPY
 # ─────────────────────────────────────────────────────────────────────────────
@@ -342,8 +349,36 @@ def detect_unusual_options(symbol):
             return empty
 
         chain = ticker.option_chain(exp_dates[0])
-        calls = chain.calls
-        puts = chain.puts
+        return detect_unusual_options_from_chain(chain.calls, chain.puts)
+    except Exception:
+        return empty
+
+
+def detect_unusual_options_from_chain(calls, puts):
+    """Detect unusual options activity from pre-fetched call/put DataFrames.
+
+    Parameters
+    ----------
+    calls : pd.DataFrame
+        Calls DataFrame from ``ticker.option_chain().calls``.
+    puts : pd.DataFrame
+        Puts DataFrame from ``ticker.option_chain().puts``.
+
+    Returns same dict as ``detect_unusual_options()``.
+    """
+    empty = {
+        "put_call_ratio": 0, "unusual_call_volume": False,
+        "max_call_oi_strike": None, "total_call_oi": 0,
+        "total_put_oi": 0, "options_signal": "N/A",
+    }
+    try:
+        if (calls is None or calls.empty) and (puts is None or puts.empty):
+            return empty
+
+        if calls is None:
+            calls = pd.DataFrame()
+        if puts is None:
+            puts = pd.DataFrame()
 
         call_oi = int(calls["openInterest"].sum()) if "openInterest" in calls.columns else 0
         put_oi = int(puts["openInterest"].sum()) if "openInterest" in puts.columns else 0
@@ -397,7 +432,23 @@ def get_earnings_proximity(symbol):
     try:
         ticker = yf.Ticker(symbol)
         cal = ticker.calendar
+        return get_earnings_from_calendar(cal)
+    except Exception:
+        return empty
 
+
+def get_earnings_from_calendar(cal):
+    """Extract earnings proximity from a pre-fetched ``ticker.calendar`` object.
+
+    Parameters
+    ----------
+    cal : dict | pd.DataFrame | None
+        The calendar object from ``yf.Ticker(symbol).calendar``.
+
+    Returns same dict as ``get_earnings_proximity()``.
+    """
+    empty = {"days_to_earnings": None, "earnings_date": None, "earnings_warning": False}
+    try:
         if cal is None:
             return empty
 

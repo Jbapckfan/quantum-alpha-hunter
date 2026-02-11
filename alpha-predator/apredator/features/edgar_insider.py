@@ -54,7 +54,7 @@ def _empty_result() -> Dict[str, Any]:
 # CIK Lookup
 # ---------------------------------------------------------------------------
 
-def _lookup_cik(symbol: str) -> str | None:
+def _lookup_cik(symbol: str):
     """Resolve a ticker symbol to a SEC Central Index Key (CIK).
 
     Uses the SEC company_tickers.json endpoint and caches the result in

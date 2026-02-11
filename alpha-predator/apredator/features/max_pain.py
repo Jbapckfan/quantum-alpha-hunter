@@ -140,6 +140,65 @@ def compute_max_pain_gex(
         return dict(_EMPTY)
 
 
+def compute_max_pain_gex_from_chain(
+    calls,
+    puts,
+    current_price: float,
+    nearest_expiry: str,
+) -> Dict[str, Any]:
+    """Compute max pain / GEX from pre-fetched option chain DataFrames.
+
+    Parameters
+    ----------
+    calls : pd.DataFrame
+        Calls DataFrame (must have ``strike``, ``openInterest``, ``impliedVolatility``).
+    puts : pd.DataFrame
+        Puts DataFrame (same columns).
+    current_price : float
+        Current underlying price.
+    nearest_expiry : str
+        Expiry date string (``"YYYY-MM-DD"``).
+
+    Returns same dict as ``compute_max_pain_gex()``.
+    """
+    try:
+        if (calls is None or calls.empty) and (puts is None or puts.empty):
+            return dict(_EMPTY)
+
+        import pandas as pd
+        if calls is None:
+            calls = pd.DataFrame(columns=["strike", "openInterest", "impliedVolatility"])
+        if puts is None:
+            puts = pd.DataFrame(columns=["strike", "openInterest", "impliedVolatility"])
+
+        max_pain_price = _calculate_max_pain(calls, puts)
+
+        if max_pain_price is not None and max_pain_price != 0:
+            max_pain_distance_pct = round(
+                (current_price - max_pain_price) / max_pain_price * 100, 2
+            )
+        else:
+            max_pain_distance_pct = 0.0
+
+        days = _days_to_expiry(nearest_expiry)
+        T = max(days / 365.0, 1.0 / 365.0)
+
+        net_gex, gex_flip_strike = _calculate_gex(calls, puts, current_price, T)
+        gex_signal = "Mean-Reverting" if net_gex > 0 else "Trending"
+
+        return {
+            "max_pain_price": round(max_pain_price, 2) if max_pain_price is not None else None,
+            "max_pain_distance_pct": max_pain_distance_pct,
+            "net_gex": round(net_gex, 2),
+            "gex_flip_strike": round(gex_flip_strike, 2) if gex_flip_strike is not None else None,
+            "gex_signal": gex_signal,
+            "expiration_date": nearest_expiry,
+        }
+    except Exception:
+        logger.exception("compute_max_pain_gex_from_chain failed")
+        return dict(_EMPTY)
+
+
 # ---------------------------------------------------------------------------
 # Max Pain calculation
 # ---------------------------------------------------------------------------

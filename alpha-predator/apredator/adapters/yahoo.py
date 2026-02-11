@@ -25,6 +25,88 @@ logger = logging.getLogger("apredator.adapters.yahoo")
 
 
 # ---------------------------------------------------------------------------
+# Ticker bundle — single yf.Ticker session for all data
+# ---------------------------------------------------------------------------
+
+def fetch_ticker_bundle(symbol: str) -> Dict:
+    """Create a single ``yf.Ticker`` and extract all commonly-needed data at once.
+
+    This replaces 7+ separate ``yf.Ticker()`` creations (fundamentals, sector,
+    short interest, earnings, options, max pain) with **one** object reuse.
+
+    Returns
+    -------
+    dict
+        Keys:
+
+        * ``info``           – ``ticker.info`` dict (fundamentals, sector, short %)
+        * ``calendar``       – ``ticker.calendar`` (earnings date)
+        * ``chain``          – ``(calls_df, puts_df)`` for the nearest expiry
+        * ``nearest_expiry`` – expiry date string used for the chain
+        * ``expirations``    – full list of option expiry strings
+    """
+    result: Dict = {
+        "info": {},
+        "calendar": None,
+        "chain": (pd.DataFrame(), pd.DataFrame()),
+        "nearest_expiry": None,
+        "expirations": [],
+    }
+
+    try:
+        ticker = yf.Ticker(symbol)
+
+        # ── .info (fundamentals, sector, short interest) ──
+        try:
+            result["info"] = ticker.info or {}
+        except Exception as exc:
+            logger.debug("Could not fetch info for %s: %s", symbol, exc)
+
+        # ── .calendar (earnings proximity) ──
+        try:
+            result["calendar"] = ticker.calendar
+        except Exception as exc:
+            logger.debug("Could not fetch calendar for %s: %s", symbol, exc)
+
+        # ── .options + .option_chain(nearest) ──
+        try:
+            expirations = ticker.options
+            result["expirations"] = list(expirations) if expirations else []
+
+            if expirations:
+                # Pick nearest future expiry
+                from datetime import datetime as _dt
+                today = _dt.utcnow().date()
+                nearest = None
+                nearest_delta = None
+                for exp_str in expirations:
+                    try:
+                        exp_date = _dt.strptime(exp_str, "%Y-%m-%d").date()
+                        delta = (exp_date - today).days
+                        if delta < 0:
+                            continue
+                        if nearest_delta is None or delta < nearest_delta:
+                            nearest_delta = delta
+                            nearest = exp_str
+                    except ValueError:
+                        continue
+                if nearest is None and expirations:
+                    nearest = expirations[-1]
+
+                if nearest:
+                    result["nearest_expiry"] = nearest
+                    chain = ticker.option_chain(nearest)
+                    result["chain"] = (chain.calls, chain.puts)
+        except Exception as exc:
+            logger.debug("Could not fetch options for %s: %s", symbol, exc)
+
+    except Exception:
+        logger.exception("fetch_ticker_bundle failed for %s", symbol)
+
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Price data
 # ---------------------------------------------------------------------------
 
@@ -88,8 +170,12 @@ def fetch_prices(
 
         if len(batch) == 1:
             sym = batch[0]
-            df = data.copy().reset_index()
-            df.columns = [c.lower() if isinstance(c, str) else c for c in df.columns]
+            df = data.copy()
+            # Flatten MultiIndex columns (newer yfinance returns tuples like ('SOFI', 'Close'))
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = [c[1] if isinstance(c, tuple) and len(c) > 1 else c for c in df.columns]
+            df = df.reset_index()
+            df.columns = [c.lower() if isinstance(c, str) else str(c).lower() for c in df.columns]
             df["symbol"] = sym
             for col in ("open", "high", "low", "close", "volume"):
                 if col not in df.columns:
@@ -99,7 +185,7 @@ def fetch_prices(
             for sym in batch:
                 try:
                     sym_data = data[sym].copy().reset_index()
-                    sym_data.columns = [c.lower() if isinstance(c, str) else c for c in sym_data.columns]
+                    sym_data.columns = [c.lower() if isinstance(c, str) else str(c).lower() for c in sym_data.columns]
                     sym_data["symbol"] = sym
                     for col in ("open", "high", "low", "close", "volume"):
                         if col not in sym_data.columns:

@@ -19,12 +19,15 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import streamlit as st
 from datetime import datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import yfinance as yf
 
 import requests
 
-from apredator.adapters.yahoo import fetch_prices
+import time
+
+from apredator.adapters.yahoo import fetch_prices, fetch_ticker_bundle
 from apredator.features.technical import compute_all_technical
 from apredator.features.explosive import compute_all_explosive
 from apredator.scoring.combo_matcher import match_combos, WINNING_COMBOS
@@ -32,16 +35,18 @@ from apredator.scoring.tier_system import classify_tier
 from apredator.scoring.position_sizer import kelly_position_size
 from apredator.features.intelligence import (
     compute_relative_strength, compute_weekly_confluence, detect_unfilled_gaps,
-    fetch_insider_activity, detect_unusual_options, get_earnings_proximity,
-    get_sector_heatmap, get_symbol_sector, SignalTracker,
+    detect_unusual_options, detect_unusual_options_from_chain,
+    get_earnings_proximity, get_earnings_from_calendar,
+    get_sector_heatmap, get_symbol_sector, get_sector_from_info,
+    SignalTracker,
 )
 from apredator.features.analogs import find_historical_analogs
 from apredator.features.fibonacci import compute_fibonacci_levels
-from apredator.features.finra import fetch_short_interest, compute_dark_pool_proxy
+from apredator.features.finra import fetch_short_interest, parse_short_interest_from_info, compute_dark_pool_proxy
 from apredator.features.watchlist import Watchlist
 from apredator.features.divergence import compute_divergences
 from apredator.features.volume_profile import compute_volume_profile
-from apredator.features.max_pain import compute_max_pain_gex
+from apredator.features.max_pain import compute_max_pain_gex, compute_max_pain_gex_from_chain
 from apredator.features.multi_timeframe import compute_multi_timeframe_score
 from apredator.features.edgar_insider import fetch_edgar_insider
 from apredator.backtest.equity_curve import simulate_equity_curve, build_equity_chart
@@ -218,6 +223,95 @@ st.markdown("""
     div[data-testid="stExpander"] summary {
         font-weight: 600 !important;
         font-size: 13px !important;
+        color: #e2e8f0 !important;
+    }
+    div[data-testid="stExpander"] summary p,
+    div[data-testid="stExpander"] summary span,
+    div[data-testid="stExpander"] details p {
+        color: #e2e8f0 !important;
+    }
+
+    /* ── Dark-mode reinforcement (native theme handles most widgets) ── */
+
+    /* Ensure ALL text elements use light colors against dark backgrounds */
+    .stApp, .stApp p, .stApp span, .stApp label, .stApp div {
+        color: #e2e8f0;
+    }
+
+    /* Sidebar text — brighter for readability */
+    section[data-testid="stSidebar"] p,
+    section[data-testid="stSidebar"] span,
+    section[data-testid="stSidebar"] label,
+    section[data-testid="stSidebar"] div {
+        color: #e2e8f0;
+    }
+    section[data-testid="stSidebar"] [data-testid="stWidgetLabel"] p {
+        color: #e2e8f0 !important;
+        font-size: 12px !important;
+    }
+
+    /* Widget labels — high contrast */
+    [data-testid="stWidgetLabel"] p,
+    [data-testid="stWidgetLabel"] label {
+        color: #e2e8f0 !important;
+    }
+
+    /* Radio & checkbox option text */
+    [role="radiogroup"] label p,
+    [role="radiogroup"] p,
+    .stCheckbox p {
+        color: #e2e8f0 !important;
+    }
+
+    /* Selectbox / multiselect — reinforce dark popover */
+    [data-baseweb="popover"] {
+        background-color: #1e293b !important;
+        border: 1px solid #334155 !important;
+    }
+    [data-baseweb="popover"] ul {
+        background-color: #1e293b !important;
+    }
+    [data-baseweb="popover"] li,
+    [data-baseweb="popover"] [role="option"] {
+        background-color: #1e293b !important;
+        color: #e2e8f0 !important;
+    }
+    [data-baseweb="popover"] li:hover,
+    [data-baseweb="popover"] [role="option"]:hover,
+    [data-baseweb="popover"] li[aria-selected="true"],
+    [data-baseweb="popover"] [role="option"][aria-selected="true"] {
+        background-color: #334155 !important;
+    }
+
+    /* Tabs */
+    .stTabs [data-baseweb="tab-list"] {
+        border-bottom-color: #1e293b !important;
+    }
+    .stTabs [data-baseweb="tab"] {
+        color: #94a3b8 !important;
+    }
+    .stTabs [data-baseweb="tab"][aria-selected="true"] {
+        color: #e2e8f0 !important;
+    }
+
+    /* Markdown text */
+    .stMarkdown h1, .stMarkdown h2, .stMarkdown h3,
+    .stMarkdown h4, .stMarkdown h5, .stMarkdown h6 {
+        color: #e2e8f0 !important;
+        font-family: 'Inter', sans-serif !important;
+    }
+    .stMarkdown p { color: #e2e8f0; }
+
+    /* Separator */
+    hr, .stMarkdown hr {
+        border-color: #1e293b !important;
+    }
+
+    /* Toast */
+    [data-testid="stToast"] {
+        background-color: #1e293b !important;
+        color: #e2e8f0 !important;
+        border-color: #334155 !important;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -416,21 +510,23 @@ def _parse_mcap(s):
 
 @st.cache_data(ttl=600, show_spinner=False)
 def fetch_fundamentals_batch(symbols):
-    """Fetch market cap and avg volume for a list of symbols via yfinance."""
+    """Fetch market cap and avg volume for a list of symbols via yfinance (parallel)."""
     result = {}
-    try:
-        tickers = yf.Tickers(" ".join(symbols))
-        for symbol in symbols:
-            try:
-                info = tickers.tickers[symbol].info
-                market_cap = info.get("marketCap", 0) or 0
-                avg_volume = info.get("averageVolume", 0) or info.get("averageDailyVolume10Day", 0) or 0
-                result[symbol] = {"market_cap": market_cap, "avg_volume": avg_volume}
-            except Exception:
-                result[symbol] = {"market_cap": 0, "avg_volume": 0}
-    except Exception:
-        for symbol in symbols:
-            result[symbol] = {"market_cap": 0, "avg_volume": 0}
+    if not symbols:
+        return result
+
+    def _fetch_one(sym):
+        try:
+            info = yf.Ticker(sym).info
+            market_cap = info.get("marketCap", 0) or 0
+            avg_volume = info.get("averageVolume", 0) or info.get("averageDailyVolume10Day", 0) or 0
+            return sym, {"market_cap": market_cap, "avg_volume": avg_volume}
+        except Exception:
+            return sym, {"market_cap": 0, "avg_volume": 0}
+
+    with ThreadPoolExecutor(max_workers=min(8, len(symbols))) as pool:
+        for sym, data in pool.map(_fetch_one, symbols):
+            result[sym] = data
     return result
 
 
@@ -458,9 +554,27 @@ def format_volume(vol):
     return "N/A"
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=900, show_spinner=False)
+def _cached_ticker_bundle(symbol):
+    """15-minute cache for the unified yfinance ticker bundle."""
+    return fetch_ticker_bundle(symbol)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _cached_edgar_insider(symbol):
+    """1-hour cache for EDGAR insider filings (data changes slowly)."""
+    return fetch_edgar_insider(symbol)
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def _cached_sector_benchmarks(period):
+    """30-minute cache for sector ETF benchmark data (13 ETF download)."""
+    from apredator.features.intelligence import fetch_sector_benchmark_data
+    return fetch_sector_benchmark_data(period)
+
+
 def analyze_symbol(symbol, period="1y"):
-    """Full analysis pipeline for a single symbol."""
+    """Full analysis pipeline for a single symbol (parallelized network calls)."""
     df = fetch_prices([symbol], period=period)
     if df.empty or len(df) < 60:
         return None
@@ -469,49 +583,21 @@ def analyze_symbol(symbol, period="1y"):
     if len(sym_df) < 60:
         return None
 
+    # ── Phase 1: CPU analysis (fast, no network) ──
     tech = compute_all_technical(sym_df)
     explosive = compute_all_explosive(sym_df)
     combos = match_combos(explosive)
     levels = compute_support_resistance(sym_df)
-
-    # New computation-only features
     divergence = compute_divergences(sym_df)
     vol_profile = compute_volume_profile(sym_df)
     mtf = compute_multi_timeframe_score(sym_df)
-
     reversal = compute_reversal_metrics(tech, explosive, sym_df, divergence=divergence)
     weekly = compute_weekly_confluence(sym_df)
     gaps = detect_unfilled_gaps(sym_df)
-
     best_combo = max(combos, key=lambda c: c["hit_rate"]) if combos else None
     kelly = kelly_position_size(best_combo["hit_rate"]) * 100 if best_combo else 0
-
     feat_dict = {**tech, **explosive, "close": sym_df["close"].iloc[-1]}
     tier_result = classify_tier(feat_dict)
-
-    # Fetch fundamentals for single symbol
-    fundies = fetch_fundamentals_batch([symbol])
-    fund = fundies.get(symbol, {"market_cap": 0, "avg_volume": 0})
-
-    # Per-symbol intelligence (only for single-symbol view, too slow for batch)
-    sector = get_symbol_sector(symbol)
-    rel_strength = compute_relative_strength(sym_df, sector=sector)
-    edgar_insider = fetch_edgar_insider(symbol)
-    # Backward-compatible insider dict
-    insider = {
-        "insider_buys": edgar_insider.get("insider_buys_90d", 0),
-        "insider_sells": edgar_insider.get("insider_sells_90d", 0),
-        "insider_net": edgar_insider.get("insider_net_90d", 0),
-        "insider_buy_value": 0,
-        "last_insider_buy": None,
-    }
-    options = detect_unusual_options(symbol)
-    earnings = get_earnings_proximity(symbol)
-
-    # Max pain & GEX (single-symbol only, requires API call)
-    max_pain = compute_max_pain_gex(symbol, float(sym_df["close"].iloc[-1]))
-
-    # Existing features: analogs, fibonacci, short interest, dark pool
     current_features = {
         "drawdown_60d": explosive.get("drawdown_60d", 0),
         "rsi_14": tech.get("rsi_14", 50),
@@ -520,16 +606,54 @@ def analyze_symbol(symbol, period="1y"):
     }
     analogs = find_historical_analogs(sym_df, current_features)
     fib = compute_fibonacci_levels(sym_df)
-    short_info = fetch_short_interest(symbol)
     dark_pool = compute_dark_pool_proxy(sym_df)
+
+    # ── Phase 2: Network calls — 1 yfinance bundle + 1 EDGAR call in parallel ──
+    current_price = float(sym_df["close"].iloc[-1])
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        bundle_future = pool.submit(_cached_ticker_bundle, symbol)
+        edgar_future = pool.submit(_cached_edgar_insider, symbol)
+        bundle = bundle_future.result() or {}
+        edgar_insider = edgar_future.result() or {}
+
+    # Extract everything from the single bundle
+    info = bundle.get("info") or {}
+    calls, puts = bundle.get("chain", (pd.DataFrame(), pd.DataFrame()))
+    nearest_expiry = bundle.get("nearest_expiry")
+
+    fund_data = {
+        "market_cap": info.get("marketCap", 0) or 0,
+        "avg_volume": info.get("averageVolume", 0) or info.get("averageDailyVolume10Day", 0) or 0,
+    }
+    sector = get_sector_from_info(info)
+    options = detect_unusual_options_from_chain(calls, puts)
+    earnings = get_earnings_from_calendar(bundle.get("calendar"))
+    short_info = parse_short_interest_from_info(info)
+
+    if nearest_expiry and not calls.empty:
+        max_pain = compute_max_pain_gex_from_chain(calls, puts, current_price, nearest_expiry)
+    else:
+        max_pain = {}
+
+    # Relative strength needs sector — runs after sector is resolved (still fast, cached benchmarks)
+    rel_strength = compute_relative_strength(sym_df, sector=sector)
+
+    insider = {
+        "insider_buys": edgar_insider.get("insider_buys_90d", 0),
+        "insider_sells": edgar_insider.get("insider_sells_90d", 0),
+        "insider_net": edgar_insider.get("insider_net_90d", 0),
+        "insider_buy_value": 0,
+        "last_insider_buy": None,
+    }
 
     return {
         "symbol": symbol, "df": sym_df, "tech": tech, "explosive": explosive,
         "combos": combos, "levels": levels, "reversal": reversal,
         "best_combo": best_combo, "kelly": kelly, "tier": tier_result,
-        "price": float(sym_df["close"].iloc[-1]),
-        "market_cap": fund["market_cap"],
-        "avg_volume": fund["avg_volume"],
+        "price": current_price,
+        "market_cap": fund_data["market_cap"],
+        "avg_volume": fund_data["avg_volume"],
         "weekly": weekly, "gaps": gaps, "sector": sector,
         "rel_strength": rel_strength, "insider": insider,
         "options": options, "earnings": earnings,
@@ -566,8 +690,15 @@ def filter_by_volume(df_all, symbols, min_vol):
     return passing
 
 
-def analyze_batch(symbols, df_all, min_mcap=0, max_mcap=0):
-    """Analyze symbols that have already been price-downloaded and volume-filtered."""
+def analyze_batch(symbols, df_all, min_mcap=0, max_mcap=0, enrich=False):
+    """Analyze symbols that have already been price-downloaded and volume-filtered (parallel).
+
+    Parameters
+    ----------
+    enrich : bool
+        If True, run a second network phase per symbol to add intelligence
+        data (sector, insider, options, short interest, max pain, earnings).
+    """
     if df_all.empty:
         return []
 
@@ -589,14 +720,14 @@ def analyze_batch(symbols, df_all, min_mcap=0, max_mcap=0):
         fundies = {}
         filtered_symbols = valid_symbols
 
-    results = []
-    progress = st.progress(0, text=f"Analyzing 0/{len(filtered_symbols)} symbols...")
-    for idx, symbol in enumerate(filtered_symbols):
+    if not filtered_symbols:
+        return []
+
+    # ── Analyze each symbol (parallelized) ──
+    def _analyze_one(symbol):
         sym_df = df_all[df_all["symbol"] == symbol].sort_values("date").reset_index(drop=True)
         if len(sym_df) < 60:
-            progress.progress((idx + 1) / len(filtered_symbols),
-                              text=f"Analyzing {idx+1}/{len(filtered_symbols)}... ({symbol} skipped)")
-            continue
+            return None
         try:
             tech = compute_all_technical(sym_df)
             explosive = compute_all_explosive(sym_df)
@@ -614,21 +745,9 @@ def analyze_batch(symbols, df_all, min_mcap=0, max_mcap=0):
             tier_result = classify_tier(feat_dict)
 
             fund = fundies.get(symbol, {})
-            # Compute avg volume from actual OHLCV data (always reliable)
             sym_avg_vol = float(sym_df["volume"].tail(20).mean()) if len(sym_df) >= 20 else float(sym_df["volume"].mean())
 
-            # Log signal to tracker
-            _tracker.log_signal(
-                symbol=symbol, price=float(sym_df["close"].iloc[-1]),
-                reversal_score=reversal["reversal_score"],
-                best_combo=best_combo["name"] if best_combo else None,
-                combo_hit_rate=best_combo["hit_rate"] if best_combo else 0,
-                tier=tier_result.get("tier"),
-                confluence_score=weekly["confluence_score"],
-                reasons=reversal["reasons"],
-            )
-
-            results.append({
+            return {
                 "symbol": symbol, "df": sym_df, "tech": tech, "explosive": explosive,
                 "combos": combos, "levels": levels, "reversal": reversal,
                 "best_combo": best_combo, "kelly": kelly, "tier": tier_result,
@@ -637,13 +756,113 @@ def analyze_batch(symbols, df_all, min_mcap=0, max_mcap=0):
                 "avg_volume": sym_avg_vol,
                 "weekly": weekly, "gaps": gaps,
                 "divergence": divergence, "vol_profile": vol_profile, "mtf": mtf,
-            })
+            }
+        except Exception:
+            return None
+
+    results = []
+    total = len(filtered_symbols)
+    progress = st.progress(0, text=f"Analyzing 0/{total} symbols...")
+    done = 0
+    t_start = time.time()
+
+    # Use threads — numpy/pandas release the GIL during computation
+    with ThreadPoolExecutor(max_workers=min(6, total)) as pool:
+        future_map = {pool.submit(_analyze_one, sym): sym for sym in filtered_symbols}
+        for future in as_completed(future_map):
+            sym = future_map[future]
+            done += 1
+            try:
+                result = future.result()
+                if result is not None:
+                    results.append(result)
+            except Exception:
+                pass
+
+            elapsed = time.time() - t_start
+            avg_per_sym = elapsed / done if done else 0
+            remaining = avg_per_sym * (total - done)
+            if remaining >= 60:
+                eta_str = f"~{remaining / 60:.1f}m left"
+            else:
+                eta_str = f"~{remaining:.0f}s left"
+            progress.progress(
+                done / total,
+                text=f"Analyzing {done}/{total}... ({sym}) — {eta_str}",
+            )
+
+    progress.empty()
+
+    # ── Optional enrichment phase: add intelligence data per symbol ──
+    if enrich and results:
+        enrich_progress = st.progress(0, text="Enriching with intelligence data...")
+
+        def _enrich_one(r):
+            sym = r["symbol"]
+            try:
+                bundle = _cached_ticker_bundle(sym)
+                edgar = _cached_edgar_insider(sym)
+                info = bundle.get("info") or {}
+                calls, puts = bundle.get("chain", (pd.DataFrame(), pd.DataFrame()))
+                nearest_expiry = bundle.get("nearest_expiry")
+                current_price = r["price"]
+
+                r["sector"] = get_sector_from_info(info)
+                r["options"] = detect_unusual_options_from_chain(calls, puts)
+                r["earnings"] = get_earnings_from_calendar(bundle.get("calendar"))
+                r["short_info"] = parse_short_interest_from_info(info)
+                r["edgar_insider"] = edgar
+                r["insider"] = {
+                    "insider_buys": edgar.get("insider_buys_90d", 0),
+                    "insider_sells": edgar.get("insider_sells_90d", 0),
+                    "insider_net": edgar.get("insider_net_90d", 0),
+                    "insider_buy_value": 0,
+                    "last_insider_buy": None,
+                }
+                if nearest_expiry and not calls.empty:
+                    r["max_pain"] = compute_max_pain_gex_from_chain(
+                        calls, puts, current_price, nearest_expiry
+                    )
+                else:
+                    r["max_pain"] = {}
+
+                r["rel_strength"] = compute_relative_strength(
+                    r["df"], sector=r.get("sector", "")
+                )
+            except Exception:
+                pass
+            return r
+
+        enrich_done = 0
+        enrich_total = len(results)
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            future_map = {pool.submit(_enrich_one, r): r["symbol"] for r in results}
+            for future in as_completed(future_map):
+                enrich_done += 1
+                enrich_progress.progress(
+                    enrich_done / enrich_total,
+                    text=f"Enriching {enrich_done}/{enrich_total}...",
+                )
+                try:
+                    future.result()
+                except Exception:
+                    pass
+        enrich_progress.empty()
+
+    # Log signals on the main thread (SQLite is not thread-safe)
+    for r in results:
+        try:
+            _tracker.log_signal(
+                symbol=r["symbol"], price=r["price"],
+                reversal_score=r["reversal"]["reversal_score"],
+                best_combo=r["best_combo"]["name"] if r["best_combo"] else None,
+                combo_hit_rate=r["best_combo"]["hit_rate"] if r["best_combo"] else 0,
+                tier=r["tier"].get("tier"),
+                confluence_score=r["weekly"]["confluence_score"],
+                reasons=r["reversal"]["reasons"],
+            )
         except Exception:
             pass
-
-        progress.progress((idx + 1) / len(filtered_symbols),
-                          text=f"Analyzing {idx+1}/{len(filtered_symbols)}... ({symbol})")
-    progress.empty()
 
     results.sort(key=lambda r: (len(r["combos"]) > 0, r["reversal"]["reversal_score"]), reverse=True)
     return results
@@ -699,60 +918,93 @@ def filter_bottomed_reversals(results):
 # Chart builders
 # ─────────────────────────────────────────────────────────────────────────────
 
-def build_price_chart(data, days=120):
-    """Build a polished chart matching the Key Resistance Levels Analysis style.
+def build_price_chart(data, days=120, show_atr_bands=False):
+    """Build a clean, professional price chart with range shading.
 
     Features:
-    - Close line with high-low range ribbon (gray shaded)
-    - MA20 (blue dashed) and MA50 (orange dashed)
-    - Color-graded resistance levels (red → orange → yellow) with R1-Rn labels
-    - Green current price line with left-side label
-    - 52-week high dotted line
-    - Red/green volume bars
-    - New feature overlays (Max Pain, VPOC, Value Area, divergence arrows)
+    - Close price line (bold) with high-low range shading (gray fill)
+    - MA20 (blue dashed) and MA50 (amber dashed)
+    - Color-graded resistance levels with touch counts [Nx]
+    - Green current price line
+    - 52-week high dotted magenta line
+    - Red/green volume bars with spike highlighting
+    - Max Pain, VPOC, Value Area, divergence overlays
+    - Optional ATR volatility bands (14-period ATR x 2 from EMA20)
+    - 2-panel layout (price + volume)
     """
-    df = data["df"].tail(days).copy()
+    df = data["df"].tail(days).copy().reset_index(drop=True)
     levels = data["levels"]
     current_price = data["price"]
     symbol = data["symbol"]
 
     fig = make_subplots(
-        rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.04,
+        rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.03,
         row_heights=[0.75, 0.25],
-        subplot_titles=[None, None],
     )
 
-    # ── High-Low Range ribbon (gray shaded band) ──
+    # ── High-Low range shading (gray fill between high and low) ──
     fig.add_trace(go.Scatter(
         x=df["date"], y=df["high"], mode="lines",
-        line=dict(color="rgba(180,180,180,0)", width=0),
-        name="Range", showlegend=True, legendgroup="range",
+        line=dict(width=0), name="Range",
+        showlegend=True, hoverinfo="skip",
+        legendgroup="range",
     ), row=1, col=1)
     fig.add_trace(go.Scatter(
-        x=df["date"], y=df["low"], mode="lines", fill="tonexty",
-        fillcolor="rgba(180,180,180,0.25)",
-        line=dict(color="rgba(180,180,180,0)", width=0),
-        name="Range", showlegend=False, legendgroup="range",
+        x=df["date"], y=df["low"], mode="lines",
+        line=dict(width=0), fill="tonexty",
+        fillcolor="rgba(148,163,184,0.12)",
+        name="Range", showlegend=False,
+        hoverinfo="skip",
+        legendgroup="range",
     ), row=1, col=1)
 
-    # ── Close line (solid black/white) ──
+    # ── Close price line (bold white/light) ──
     fig.add_trace(go.Scatter(
         x=df["date"], y=df["close"], mode="lines",
-        line=dict(color="#e2e8f0", width=2.2),
-        name="Close",
+        line=dict(color="#e2e8f0", width=2.5), name="Close",
+        hovertemplate="Close: $%{y:.2f}<extra></extra>",
     ), row=1, col=1)
 
-    # ── Moving averages (dashed) ──
+    # ── Moving averages ──
     ma20 = df["close"].rolling(20).mean()
     fig.add_trace(go.Scatter(
         x=df["date"], y=ma20, mode="lines",
-        line=dict(color="#6366f1", width=1.5, dash="dash"), name="MA20",
+        line=dict(color="#3b82f6", width=1.5, dash="dash"), name="MA20",
+        hovertemplate="MA20: $%{y:.2f}<extra></extra>",
     ), row=1, col=1)
+
     ma50 = df["close"].rolling(50).mean()
     fig.add_trace(go.Scatter(
         x=df["date"], y=ma50, mode="lines",
         line=dict(color="#f59e0b", width=1.5, dash="dash"), name="MA50",
+        hovertemplate="MA50: $%{y:.2f}<extra></extra>",
     ), row=1, col=1)
+
+    # ── Optional ATR volatility bands (14-period ATR × 2 from EMA20) ──
+    if show_atr_bands:
+        ema20 = df["close"].ewm(span=20, adjust=False).mean()
+        tr = pd.concat([
+            df["high"] - df["low"],
+            (df["high"] - df["close"].shift(1)).abs(),
+            (df["low"] - df["close"].shift(1)).abs(),
+        ], axis=1).max(axis=1)
+        atr14 = tr.rolling(14).mean()
+        upper_band = ema20 + 2 * atr14
+        lower_band = ema20 - 2 * atr14
+
+        fig.add_trace(go.Scatter(
+            x=df["date"], y=upper_band, mode="lines",
+            line=dict(color="rgba(168,85,247,0.5)", width=1, dash="dot"),
+            name="ATR Upper", showlegend=True,
+            hovertemplate="ATR Upper: $%{y:.2f}<extra></extra>",
+        ), row=1, col=1)
+        fig.add_trace(go.Scatter(
+            x=df["date"], y=lower_band, mode="lines",
+            line=dict(color="rgba(168,85,247,0.5)", width=1, dash="dot"),
+            name="ATR Lower", showlegend=True,
+            fill="tonexty", fillcolor="rgba(168,85,247,0.04)",
+            hovertemplate="ATR Lower: $%{y:.2f}<extra></extra>",
+        ), row=1, col=1)
 
     # ── 52-Week High (dotted magenta line) ──
     full_df = data["df"]
@@ -765,8 +1017,7 @@ def build_price_chart(data, days=120):
         annotation_font=dict(size=10, color="rgba(200,120,220,0.8)", family="Inter, sans-serif"),
     )
 
-    # ── S/R levels — color-graded resistance/support with R1-Rn / S1-Sn labels ──
-    # Separate resistances and supports, sort by distance from current price
+    # ── S/R levels — color-graded with touch counts [Nx] ──
     resistances = sorted(
         [l for l in levels if l["type"] == "resistance" and l["price"] > current_price],
         key=lambda l: l["price"],
@@ -776,7 +1027,6 @@ def build_price_chart(data, days=120):
         key=lambda l: l["price"], reverse=True,
     )
 
-    # De-cluster: skip levels within 1.5% of the previous kept level
     def _decluster(lvls, min_gap_pct=1.5):
         kept = []
         for lv in lvls:
@@ -788,40 +1038,36 @@ def build_price_chart(data, days=120):
     resistances = _decluster(resistances)
     supports = _decluster(supports)
 
-    # Color gradient for resistances (cap at 4)
     _r_colors = [
-        ("#ef4444", 2.0),   # R1 — red
-        ("#f97316", 1.5),   # R2 — orange
-        ("#f59e0b", 1.2),   # R3 — amber
-        ("#eab308", 1.0),   # R4 — yellow
+        ("#ef4444", 2.2), ("#f97316", 1.8), ("#f59e0b", 1.4), ("#eab308", 1.2), ("#fbbf24", 1.0),
     ]
-    for i, level in enumerate(resistances[:4]):
-        color, width = _r_colors[i] if i < len(_r_colors) else ("#eab308", 1.0)
+    for i, level in enumerate(resistances[:5]):
+        color, width = _r_colors[i] if i < len(_r_colors) else ("#fbbf24", 1.0)
         pct = (level["price"] / current_price - 1) * 100
-        label = f"R{i+1} ${level['price']:.2f} +{pct:.0f}%"
+        touches = level.get("touches", 0)
+        touch_str = f" [{touches}x]" if touches > 0 else ""
+        label = f"R{i+1} ${level['price']:.2f} +{pct:.0f}%{touch_str}"
         fig.add_hline(
             y=level["price"], line_dash="dash", line_color=color, line_width=width,
             row=1, col=1,
             annotation_text=f"  {label}",
             annotation_position="right" if i % 2 == 0 else "left",
-            annotation_font=dict(size=9, color=color, family="Inter, sans-serif"),
+            annotation_font=dict(size=10, color=color, family="Inter, sans-serif"),
         )
 
-    # Supports: green shades (cap at 2)
-    _s_colors = [
-        ("#22c55e", 1.5),   # S1 — green
-        ("#4ade80", 1.2),   # S2
-    ]
+    _s_colors = [("#22c55e", 1.5), ("#4ade80", 1.2)]
     for i, level in enumerate(supports[:2]):
         color, width = _s_colors[i] if i < len(_s_colors) else ("#86efac", 1.0)
         pct = (level["price"] / current_price - 1) * 100
-        label = f"S{i+1} ${level['price']:.2f} {pct:.0f}%"
+        touches = level.get("touches", 0)
+        touch_str = f" [{touches}x]" if touches > 0 else ""
+        label = f"S{i+1} ${level['price']:.2f} {pct:.0f}%{touch_str}"
         fig.add_hline(
             y=level["price"], line_dash="dash", line_color=color, line_width=width,
             row=1, col=1,
             annotation_text=f"  {label}",
             annotation_position="right" if i % 2 == 1 else "left",
-            annotation_font=dict(size=9, color=color, family="Inter, sans-serif"),
+            annotation_font=dict(size=10, color=color, family="Inter, sans-serif"),
         )
 
     # ── Current price line (green solid, label on left) ──
@@ -830,7 +1076,7 @@ def build_price_chart(data, days=120):
         row=1, col=1,
         annotation_text=f"Current: ${current_price:.2f}  ",
         annotation_position="left",
-        annotation_font=dict(size=11, color="#fbbf24", family="Inter, sans-serif"),
+        annotation_font=dict(size=11, color="#22c55e", family="Inter, sans-serif"),
     )
 
     # ── Max Pain line (magenta dashed) ──
@@ -864,34 +1110,53 @@ def build_price_chart(data, days=120):
     # ── Divergence annotations (arrows at pivots) ──
     div_data = data.get("divergence")
     if div_data and div_data.get("divergences"):
+        full_len = len(data["df"])
+        chart_offset = full_len - len(df)
         for d in div_data["divergences"]:
             bar_idx = d.get("bar_index")
-            if bar_idx is not None and 0 <= bar_idx < len(df):
-                row_data = df.iloc[bar_idx]
-                is_bullish = "bullish" in d.get("type", "").lower()
-                fig.add_annotation(
-                    x=row_data["date"],
-                    y=float(row_data["low"]) * 0.995 if is_bullish else float(row_data["high"]) * 1.005,
-                    text="Div",
-                    showarrow=True,
-                    arrowhead=2, arrowsize=1.2, arrowwidth=2,
-                    arrowcolor="#22c55e" if is_bullish else "#ef4444",
-                    ay=30 if is_bullish else -30,
-                    font=dict(size=9, color="#22c55e" if is_bullish else "#ef4444", family="Inter"),
-                    row=1, col=1,
-                )
+            if bar_idx is not None:
+                chart_idx = bar_idx - chart_offset
+                if 0 <= chart_idx < len(df):
+                    row_data = df.iloc[chart_idx]
+                    is_bullish = "bullish" in d.get("type", "").lower()
+                    fig.add_annotation(
+                        x=row_data["date"],
+                        y=float(row_data["low"]) * 0.995 if is_bullish else float(row_data["high"]) * 1.005,
+                        text="Div",
+                        showarrow=True,
+                        arrowhead=2, arrowsize=1.2, arrowwidth=2,
+                        arrowcolor="#22c55e" if is_bullish else "#ef4444",
+                        ay=30 if is_bullish else -30,
+                        font=dict(size=9, color="#22c55e" if is_bullish else "#ef4444", family="Inter"),
+                        row=1, col=1,
+                    )
 
-    # ── Volume bars (red/green, no MA overlay) ──
-    vol_colors = [
-        "#22c55e" if c >= o else "#ef4444"
-        for c, o in zip(df["close"], df["open"])
-    ]
+    # ── Volume bars — spike highlighting (>2x 20d MA = bright amber) ──
+    vol_ma = df["volume"].rolling(20).mean()
+    vol_colors = []
+    for i, (c, o) in enumerate(zip(df["close"], df["open"])):
+        vol_val = df["volume"].iloc[i]
+        ma_val = vol_ma.iloc[i] if pd.notna(vol_ma.iloc[i]) else 0
+        if ma_val > 0 and vol_val > 2 * ma_val:
+            vol_colors.append("#f59e0b")  # bright amber for volume spikes
+        elif c >= o:
+            vol_colors.append("#22c55e")
+        else:
+            vol_colors.append("#ef4444")
+
     fig.add_trace(go.Bar(
         x=df["date"], y=df["volume"], marker_color=vol_colors,
-        marker_line_width=0, name="Volume", showlegend=False,
+        marker_line_width=0, opacity=0.7, name="Volume", showlegend=False,
+        hovertemplate="Vol: %{y:,.0f}<extra></extra>",
     ), row=2, col=1)
 
-    # ── Layout ──
+    fig.add_trace(go.Scatter(
+        x=df["date"], y=vol_ma, mode="lines",
+        line=dict(color="#f59e0b", width=1.2), name="Vol MA20",
+        showlegend=False, hoverinfo="skip",
+    ), row=2, col=1)
+
+    # ── Layout — clean 2-panel ──
     fig.update_layout(
         title=dict(
             text=f"{symbol} — Key Resistance Levels Analysis",
@@ -900,37 +1165,62 @@ def build_price_chart(data, days=120):
         ),
         template="plotly_dark",
         paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="#080c14",
-        height=640, margin=dict(l=60, r=160, t=50, b=40),
+        height=640, margin=dict(l=60, r=160, t=50, b=10),
         xaxis_rangeslider_visible=False,
         legend=dict(
             font=dict(size=11, family="Inter, sans-serif", color="#94a3b8"),
             bgcolor="rgba(17,24,39,0.8)", bordercolor="rgba(30,41,59,0.5)", borderwidth=1,
             x=0.01, y=0.99, yanchor="top",
+            orientation="h",
         ),
-        yaxis=dict(
-            title=dict(text="Price ($)", font=dict(size=12, color="#94a3b8", family="Inter")),
-            gridcolor="rgba(30,41,59,0.4)", side="left", zeroline=False,
-            tickfont=dict(size=10, color="#94a3b8", family="SF Mono, monospace"),
-            tickprefix="$",
-        ),
-        yaxis2=dict(
-            title=dict(text="Volume (M)", font=dict(size=11, color="#94a3b8", family="Inter")),
-            gridcolor="rgba(30,41,59,0.2)", side="left", zeroline=False,
-            tickfont=dict(size=9, color="#64748b", family="SF Mono, monospace"),
-            showgrid=False,
-        ),
-        xaxis=dict(
-            gridcolor="rgba(30,41,59,0.3)", zeroline=False,
-            tickfont=dict(size=10, color="#64748b"),
-        ),
-        xaxis2=dict(
-            title=dict(text="Date", font=dict(size=11, color="#94a3b8", family="Inter")),
-            gridcolor="rgba(30,41,59,0.3)", zeroline=False,
-            tickfont=dict(size=10, color="#64748b"),
-        ),
+        hovermode="x unified",
         hoverlabel=dict(
             bgcolor="#1e293b", bordercolor="#334155",
             font=dict(size=12, family="Inter, sans-serif", color="#e2e8f0"),
+        ),
+        dragmode="zoom",
+
+        # Price axis
+        yaxis=dict(
+            title=dict(text="Price ($)", font=dict(size=12, color="#94a3b8", family="Inter")),
+            gridcolor="rgba(30,41,59,0.4)", side="right", zeroline=False,
+            tickfont=dict(size=10, color="#94a3b8", family="SF Mono, monospace"),
+            tickprefix="$",
+            showspikes=True, spikemode="across", spikethickness=0.5,
+            spikecolor="rgba(148,163,184,0.3)", spikedash="dot",
+        ),
+        # Volume axis
+        yaxis2=dict(
+            title=dict(text="Volume", font=dict(size=10, color="#64748b", family="Inter")),
+            gridcolor="rgba(30,41,59,0.15)", side="right", zeroline=False,
+            tickfont=dict(size=8, color="#64748b", family="SF Mono, monospace"),
+            showgrid=False,
+        ),
+        # X axes
+        xaxis=dict(
+            gridcolor="rgba(30,41,59,0.3)", zeroline=False,
+            tickfont=dict(size=10, color="#64748b"),
+            showspikes=True, spikemode="across", spikethickness=0.5,
+            spikecolor="rgba(148,163,184,0.3)", spikedash="dot",
+        ),
+        xaxis2=dict(
+            gridcolor="rgba(30,41,59,0.15)", zeroline=False,
+            tickfont=dict(size=9, color="#64748b"),
+            rangeselector=dict(
+                buttons=list([
+                    dict(count=5, label="1W", step="day", stepmode="backward"),
+                    dict(count=1, label="1M", step="month", stepmode="backward"),
+                    dict(count=3, label="3M", step="month", stepmode="backward"),
+                    dict(count=6, label="6M", step="month", stepmode="backward"),
+                    dict(label="All", step="all"),
+                ]),
+                font=dict(size=11, color="#e2e8f0", family="Inter"),
+                bgcolor="rgba(17,24,39,0.8)",
+                activecolor="rgba(59,130,246,0.3)",
+                bordercolor="rgba(30,41,59,0.5)",
+                borderwidth=1,
+                x=0, y=1.0,
+            ),
         ),
     )
     return fig
@@ -940,14 +1230,13 @@ def build_price_chart(data, days=120):
 # UI Components
 # ─────────────────────────────────────────────────────────────────────────────
 
-def render_metric_card(label, value, detail="", color="blue"):
-    st.markdown(f"""
-    <div class="metric-card {color}">
+def _render_unavailable(label, reason):
+    """Render a styled 'data unavailable' card with a specific reason."""
+    st.markdown(f"""<div class="metric-card blue">
         <div class="metric-label">{label}</div>
-        <div class="metric-value" style="color: var(--{'accent-' + color if color != 'white' else 'text-primary'})">{value}</div>
-        <div class="metric-detail">{detail}</div>
-    </div>
-    """, unsafe_allow_html=True)
+        <div class="metric-value" style="color:#475569;font-size:13px">Unavailable</div>
+        <div class="metric-detail">{reason}</div>
+    </div>""", unsafe_allow_html=True)
 
 
 def render_symbol_detail(data):
@@ -1031,12 +1320,15 @@ def render_symbol_detail(data):
     st.markdown("<div style='height:16px'></div>", unsafe_allow_html=True)
 
     # ── Chart ──
-    fig = build_price_chart(data, days=chart_days)
+    show_atr = st.checkbox("Show ATR volatility bands", value=False, key=f"atr_{data['symbol']}")
+    fig = build_price_chart(data, days=chart_days, show_atr_bands=show_atr)
     st.markdown('<div class="chart-container">', unsafe_allow_html=True)
-    st.plotly_chart(fig, use_container_width=True, config={
+    st.plotly_chart(fig, width="stretch", config={
         "displayModeBar": True,
-        "modeBarButtonsToRemove": ["lasso2d", "select2d"],
+        "modeBarButtonsToRemove": ["lasso2d", "select2d", "autoScale2d"],
+        "modeBarButtonsToAdd": ["drawline", "drawopenpath", "eraseshape"],
         "displaylogo": False,
+        "scrollZoom": True,
     })
     st.markdown('</div>', unsafe_allow_html=True)
 
@@ -1168,10 +1460,7 @@ def render_symbol_detail(data):
                     <div class="metric-detail">vs SPY {spy_rs:+.1f}% | vs Sector {sec_rs:+.1f}%</div>
                 </div>""", unsafe_allow_html=True)
             else:
-                st.markdown("""<div class="metric-card blue">
-                    <div class="metric-label">Relative Strength</div>
-                    <div class="metric-value" style="color:#64748b;font-size:14px">Scan for detail</div>
-                </div>""", unsafe_allow_html=True)
+                _render_unavailable("Relative Strength", "No sector benchmarks loaded")
 
         # Insider activity (EDGAR-enhanced when available)
         with intel_cols[2]:
@@ -1209,10 +1498,7 @@ def render_symbol_detail(data):
                     <div class="metric-detail">{buys} buys / {sells} sells</div>
                 </div>""", unsafe_allow_html=True)
             else:
-                st.markdown("""<div class="metric-card blue">
-                    <div class="metric-label">Insider Activity</div>
-                    <div class="metric-value" style="color:#64748b;font-size:14px">Scan for detail</div>
-                </div>""", unsafe_allow_html=True)
+                _render_unavailable("Insider Activity", "No EDGAR filings found")
 
         # Earnings proximity
         with intel_cols[3]:
@@ -1234,10 +1520,7 @@ def render_symbol_detail(data):
                         <div class="metric-value" style="color:#64748b;font-size:14px">Unknown</div>
                     </div>""", unsafe_allow_html=True)
             else:
-                st.markdown("""<div class="metric-card blue">
-                    <div class="metric-label">Next Earnings</div>
-                    <div class="metric-value" style="color:#64748b;font-size:14px">Scan for detail</div>
-                </div>""", unsafe_allow_html=True)
+                _render_unavailable("Next Earnings", "No calendar data available")
 
         # Options flow (second row)
         if options and options.get("options_signal") != "N/A":
@@ -1422,7 +1705,7 @@ def render_new_features(data):
                         "Title": f.get("title", "")[:80],
                         "Link": f.get("link", ""),
                     })
-                st.dataframe(pd.DataFrame(filing_rows), use_container_width=True, hide_index=True)
+                st.dataframe(pd.DataFrame(filing_rows), width="stretch", hide_index=True)
 
     # Volume profile detail expander
     if vp and vp.get("volume_profile"):
@@ -1434,7 +1717,7 @@ def render_new_features(data):
                     "Volume": f"{level['volume']:,.0f}",
                 })
             if vp_rows:
-                st.dataframe(pd.DataFrame(vp_rows), use_container_width=True, hide_index=True)
+                st.dataframe(pd.DataFrame(vp_rows), width="stretch", hide_index=True)
 
     # MTF detail expander
     if mtf and mtf.get("daily_detail"):
@@ -1453,7 +1736,7 @@ def render_new_features(data):
                         "Score": f"{d.get('score', 0)}/4",
                     })
             if mtf_rows:
-                st.dataframe(pd.DataFrame(mtf_rows), use_container_width=True, hide_index=True)
+                st.dataframe(pd.DataFrame(mtf_rows), width="stretch", hide_index=True)
 
 
 def render_advanced_intel(data):
@@ -1589,7 +1872,7 @@ def render_advanced_intel(data):
                         "10d Fwd": f"{m['fwd_10d']:+.1f}%",
                         "20d Fwd": f"{m['fwd_20d']:+.1f}%",
                     })
-                st.dataframe(pd.DataFrame(match_rows), use_container_width=True, hide_index=True)
+                st.dataframe(pd.DataFrame(match_rows), width="stretch", hide_index=True)
 
     # Fibonacci levels detail
     if fib and fib.get("levels"):
@@ -1601,11 +1884,17 @@ def render_advanced_intel(data):
                     "Price": f"${lvl['price']:.2f}",
                     "vs Current": f"{(lvl['price'] / data.get('price', 1) - 1) * 100:+.1f}%",
                 })
-            st.dataframe(pd.DataFrame(fib_rows), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(fib_rows), width="stretch", hide_index=True)
 
 
-def render_scan_results_table(results):
-    """Render the scan results as a sortable table."""
+def render_scan_results_table(results, show_extended=False):
+    """Render the scan results as a sortable table.
+
+    Parameters
+    ----------
+    show_extended : bool
+        If True, show all 17 columns. If False, show compact 8-column view.
+    """
     if not results:
         st.info("No results. Run a scan to get started.")
         return None
@@ -1614,29 +1903,128 @@ def render_scan_results_table(results):
     for r in results:
         rev = r["reversal"]
         wk = r.get("weekly", {})
-        rows.append({
+        row = {
             "Symbol": r["symbol"],
             "Price": r["price"],
-            "Mkt Cap": format_market_cap(r.get("market_cap", 0)),
             "Rev Score": rev["reversal_score"],
-            "Wk Conf": f"{wk.get('confluence_score', 0)}/3",
             "RSI": round(rev["rsi"], 1),
             "DD%": round(rev["drawdown"], 0),
-            "5d%": round(rev["ret_5d"], 1),
-            "20d%": round(rev["ret_20d"], 1),
-            "VolR": round(rev["vol_ratio"], 1),
-            "Combos": len(r["combos"]),
             "Best Combo": r["best_combo"]["name"] if r["best_combo"] else "—",
             "Hit Rate": f"{r['best_combo']['hit_rate']*100:.1f}%" if r["best_combo"] else "—",
-            "Gaps": len(r.get("gaps", [])),
-            "Div": r.get("divergence", {}).get("divergence_type", "None"),
-            "VPOC": r.get("vol_profile", {}).get("price_vs_value_area", "—"),
-            "MTF": round(r.get("mtf", {}).get("mtf_score", 0)),
             "Signals": ", ".join(rev["reasons"][:3]),
-        })
+        }
+        if show_extended:
+            row.update({
+                "Mkt Cap": format_market_cap(r.get("market_cap", 0)),
+                "Wk Conf": f"{wk.get('confluence_score', 0)}/3",
+                "5d%": round(rev["ret_5d"], 1),
+                "20d%": round(rev["ret_20d"], 1),
+                "VolR": round(rev["vol_ratio"], 1),
+                "Gaps": len(r.get("gaps", [])),
+                "Div": r.get("divergence", {}).get("divergence_type", "None"),
+                "VPOC": r.get("vol_profile", {}).get("price_vs_value_area", "—"),
+                "MTF": round(r.get("mtf", {}).get("mtf_score", 0)),
+            })
+        rows.append(row)
 
     df = pd.DataFrame(rows)
     return df
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Post-scan filter engine
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _apply_post_filters(results, *, min_avg_vol=0, min_rev_score=0,
+                        flt_min_price=0, flt_max_price=0,
+                        flt_rsi_min=0, flt_rsi_max=100,
+                        flt_min_drawdown=0,
+                        flt_min_5d_ret=-999, flt_max_20d_ret=999,
+                        flt_require_combo=False,
+                        flt_min_confluence=0, flt_min_mtf=0,
+                        flt_divergence="Any", flt_vol_profile="Any"):
+    """Apply all post-scan filters to results list. Returns filtered list."""
+    out = []
+    for r in results:
+        rev = r["reversal"]
+        # Volume
+        if min_avg_vol > 0 and r.get("avg_volume", 0) < min_avg_vol:
+            continue
+        # Reversal score
+        if min_rev_score > 0 and rev["reversal_score"] < min_rev_score:
+            continue
+        # Price
+        if flt_min_price > 0 and r["price"] < flt_min_price:
+            continue
+        if flt_max_price > 0 and r["price"] > flt_max_price:
+            continue
+        # RSI
+        rsi = rev.get("rsi", 50)
+        if rsi < flt_rsi_min or rsi > flt_rsi_max:
+            continue
+        # Drawdown
+        if flt_min_drawdown > 0 and rev.get("drawdown", 0) < flt_min_drawdown:
+            continue
+        # 5d return
+        if flt_min_5d_ret > -999 and rev.get("ret_5d", 0) < flt_min_5d_ret:
+            continue
+        # 20d return
+        if flt_max_20d_ret < 999 and rev.get("ret_20d", 0) > flt_max_20d_ret:
+            continue
+        # Combo
+        if flt_require_combo and len(r.get("combos", [])) == 0:
+            continue
+        # Weekly confluence
+        if flt_min_confluence > 0:
+            cs = r.get("weekly", {}).get("confluence_score", 0)
+            if cs < flt_min_confluence:
+                continue
+        # MTF
+        if flt_min_mtf > 0:
+            mtf_s = r.get("mtf", {}).get("mtf_score", 0)
+            if mtf_s < flt_min_mtf:
+                continue
+        # Divergence
+        if flt_divergence != "Any":
+            div = r.get("divergence", {})
+            if flt_divergence == "Bullish only" and not div.get("has_bullish_div"):
+                continue
+            elif flt_divergence == "Bearish only" and not div.get("has_bearish_div"):
+                continue
+            elif flt_divergence == "Has divergence":
+                if not div.get("has_bullish_div") and not div.get("has_bearish_div"):
+                    continue
+        # Volume profile position
+        if flt_vol_profile != "Any":
+            vp_pos = r.get("vol_profile", {}).get("price_vs_value_area", "")
+            if flt_vol_profile == "Below (undervalued)" and vp_pos != "below":
+                continue
+            elif flt_vol_profile == "Inside" and vp_pos != "inside":
+                continue
+            elif flt_vol_profile == "Above (overvalued)" and vp_pos != "above":
+                continue
+
+        out.append(r)
+    return out
+
+
+def _sort_results(results, sort_by):
+    """Sort results by the chosen criterion."""
+    sort_map = {
+        "Reversal Score": lambda r: r["reversal"]["reversal_score"],
+        "RSI (lowest first)": lambda r: -r["reversal"].get("rsi", 50),
+        "Drawdown (deepest first)": lambda r: r["reversal"].get("drawdown", 0),
+        "5d Return (best first)": lambda r: r["reversal"].get("ret_5d", 0),
+        "Combo Hit Rate": lambda r: r["best_combo"]["hit_rate"] if r.get("best_combo") else 0,
+        "Weekly Confluence": lambda r: r.get("weekly", {}).get("confluence_score", 0),
+        "MTF Score": lambda r: r.get("mtf", {}).get("mtf_score", 0),
+        "Volume Ratio": lambda r: r["reversal"].get("vol_ratio", 0),
+        "Price (low to high)": lambda r: -r["price"],
+        "Price (high to low)": lambda r: r["price"],
+    }
+    key_fn = sort_map.get(sort_by, sort_map["Reversal Score"])
+    # All sort descending except "RSI lowest" and "Price low to high" which use negative keys
+    return sorted(results, key=key_fn, reverse=True)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1655,7 +2043,7 @@ with st.sidebar:
         placeholder="SOFI, RIOT, IONQ...",
         help="Enter one or more ticker symbols separated by commas",
     )
-    search_btn = st.button("Analyze", type="primary", use_container_width=True)
+    search_btn = st.button("Analyze", type="primary", width="stretch")
 
     st.markdown("---")
 
@@ -1674,12 +2062,16 @@ with st.sidebar:
     preset_name = st.selectbox("🌐 Universe", preset_keys, index=preset_keys.index("Full Market (All US Stocks)"))
 
     # ── Filters (above the scan button so they take effect) ──
-    with st.expander("📏 Filters", expanded=False):
+    with st.expander("📏 Filters", expanded=True):
+
+        # ── Market & Liquidity ──
+        st.markdown('<span style="color:#94a3b8;font-size:10px;text-transform:uppercase;letter-spacing:1.5px;font-weight:600">Market & Liquidity</span>', unsafe_allow_html=True)
         mcap_options = {
             "No filter": (0, 0),
             "Nano (<$50M)": (0, 50_000_000),
             "Micro ($50M–$300M)": (50_000_000, 300_000_000),
             "Small ($300M–$2B)": (300_000_000, 2_000_000_000),
+            "Mid ($2B–$10B)": (2_000_000_000, 10_000_000_000),
             "$100M–$100B": (100_000_000, 100_000_000_000),
             "$200M–$250B": (200_000_000, 250_000_000_000),
             "Custom range": None,
@@ -1710,18 +2102,91 @@ with st.sidebar:
         vol_choice = st.selectbox("Min avg daily volume", list(vol_options.keys()), index=0)
         min_avg_vol = vol_options[vol_choice]
 
+        _price_cols = st.columns(2)
+        with _price_cols[0]:
+            flt_min_price = st.number_input("Min price $", min_value=0.0, value=0.0, step=1.0, key="flt_min_price",
+                                             help="Exclude penny stocks below this price")
+        with _price_cols[1]:
+            flt_max_price = st.number_input("Max price $", min_value=0.0, value=0.0, step=10.0, key="flt_max_price",
+                                             help="0 = no max. Useful for filtering to affordable stocks.")
+
+        st.markdown("---")
+
+        # ── Technical Signals ──
+        st.markdown('<span style="color:#94a3b8;font-size:10px;text-transform:uppercase;letter-spacing:1.5px;font-weight:600">Technical Signals</span>', unsafe_allow_html=True)
+
         min_rev_score = st.slider(
             "Min reversal score", 0, 100, 0,
-            help="Filter results after scanning. Reversal scores range 0-100+. "
-                 "In Bottomed Reversals mode, baseline is 25. Drag higher to show only strongest setups.",
+            help="Reversal scores range 0–100+. In Bottomed Reversals mode, baseline is 25. "
+                 "Drag higher to show only strongest setups.",
         )
 
-        # Live count in sidebar so user sees filter effect immediately
+        _rsi_cols = st.columns(2)
+        with _rsi_cols[0]:
+            flt_rsi_min = st.number_input("RSI min", min_value=0, max_value=100, value=0, step=5, key="flt_rsi_min")
+        with _rsi_cols[1]:
+            flt_rsi_max = st.number_input("RSI max", min_value=0, max_value=100, value=100, step=5, key="flt_rsi_max",
+                                           help="Cap RSI to exclude overbought stocks (e.g. 50)")
+
+        flt_min_drawdown = st.slider(
+            "Min drawdown %", 0, 80, 0,
+            help="Only show stocks that have pulled back at least this much from their 60-day high.",
+        )
+
+        _ret_cols = st.columns(2)
+        with _ret_cols[0]:
+            flt_min_5d_ret = st.number_input("Min 5d return %", value=-999.0, step=1.0, key="flt_5d_min",
+                                              help="Positive = only bouncing stocks")
+        with _ret_cols[1]:
+            flt_max_20d_ret = st.number_input("Max 20d return %", value=999.0, step=1.0, key="flt_20d_max",
+                                               help="Negative = still trending down over 20d")
+
+        st.markdown("---")
+
+        # ── Pattern & Confluence ──
+        st.markdown('<span style="color:#94a3b8;font-size:10px;text-transform:uppercase;letter-spacing:1.5px;font-weight:600">Pattern & Confluence</span>', unsafe_allow_html=True)
+
+        flt_require_combo = st.checkbox("Require combo match", value=False,
+                                         help="Only show stocks with at least one backtested winning combo confirmed.")
+
+        _conf_cols = st.columns(2)
+        with _conf_cols[0]:
+            flt_min_confluence = st.selectbox("Min weekly confluence", [0, 1, 2, 3], index=0,
+                                               help="Weekly confluence = RSI + MACD + trend alignment (0-3)")
+        with _conf_cols[1]:
+            flt_min_mtf = st.number_input("Min MTF score", min_value=0, max_value=100, value=0, step=10, key="flt_mtf",
+                                           help="Multi-timeframe alignment score (0-100)")
+
+        flt_divergence = st.selectbox("Divergence filter", ["Any", "Bullish only", "Bearish only", "Has divergence"],
+                                       index=0, help="Filter by price/RSI divergence signals")
+
+        flt_vol_profile = st.selectbox("Price vs value area", ["Any", "Below (undervalued)", "Inside", "Above (overvalued)"],
+                                        index=0, help="Where price sits relative to the volume-weighted value area")
+
+        st.markdown("---")
+
+        # ── Sort ──
+        st.markdown('<span style="color:#94a3b8;font-size:10px;text-transform:uppercase;letter-spacing:1.5px;font-weight:600">Sort Results By</span>', unsafe_allow_html=True)
+        flt_sort_by = st.selectbox("Sort by", [
+            "Reversal Score", "RSI (lowest first)", "Drawdown (deepest first)",
+            "5d Return (best first)", "Combo Hit Rate", "Weekly Confluence",
+            "MTF Score", "Volume Ratio", "Price (low to high)", "Price (high to low)",
+        ], index=0)
+
+        # ── Live count ──
         if st.session_state.get("scan_results"):
             _all = st.session_state.scan_results
-            _after_vol = [r for r in _all if r.get("avg_volume", 0) >= min_avg_vol] if min_avg_vol > 0 else _all
-            _after_rev = [r for r in _after_vol if r["reversal"]["reversal_score"] >= min_rev_score] if min_rev_score > 0 else _after_vol
-            _shown = len(_after_rev)
+            _filtered = _apply_post_filters(_all,
+                min_avg_vol=min_avg_vol, min_rev_score=min_rev_score,
+                flt_min_price=flt_min_price, flt_max_price=flt_max_price,
+                flt_rsi_min=flt_rsi_min, flt_rsi_max=flt_rsi_max,
+                flt_min_drawdown=flt_min_drawdown,
+                flt_min_5d_ret=flt_min_5d_ret, flt_max_20d_ret=flt_max_20d_ret,
+                flt_require_combo=flt_require_combo,
+                flt_min_confluence=flt_min_confluence, flt_min_mtf=flt_min_mtf,
+                flt_divergence=flt_divergence, flt_vol_profile=flt_vol_profile,
+            )
+            _shown = len(_filtered)
             _total = len(_all)
             if _shown < _total:
                 st.caption(f"Showing **{_shown}** of {_total} results")
@@ -1732,11 +2197,17 @@ with st.sidebar:
     with st.expander("⚙️ Settings", expanded=False):
         chart_days = st.slider("Chart days", 30, 252, 120)
         period = st.selectbox("Data period", ["6mo", "1y", "2y"], index=1)
+        enrich_batch = st.checkbox(
+            "Enrich with intelligence data",
+            value=False,
+            help="After CPU analysis, fetch sector, insider, options, short interest, "
+                 "max pain, and earnings for each batch result. Slower but more data.",
+        )
 
     scan_btn = st.button(
         "🔥 Find Reversals" if scan_mode == "Bottomed Reversals" else "Scan Universe",
         type="primary" if scan_mode == "Bottomed Reversals" else "secondary",
-        use_container_width=True,
+        width="stretch",
     )
 
     st.markdown("---")
@@ -1780,7 +2251,7 @@ if search_btn and search_input.strip():
         filtered = filter_by_volume(df_all, symbols, min_avg_vol)
         st.toast(f"Analyzing {len(filtered)} symbols" + (f" ({len(symbols) - len(filtered)} excluded by vol filter)" if min_avg_vol > 0 else ""))
         with st.spinner(f"Analyzing {len(filtered)} symbols..."):
-            results = analyze_batch(filtered, df_all, min_mcap=min_mcap, max_mcap=max_mcap)
+            results = analyze_batch(filtered, df_all, min_mcap=min_mcap, max_mcap=max_mcap, enrich=enrich_batch)
             if scan_mode == "Bottomed Reversals":
                 results = filter_bottomed_reversals(results)
             st.session_state.scan_results = results
@@ -1795,23 +2266,30 @@ if scan_btn:
     else:
         symbols = PRESETS[preset_name]
 
-    with st.spinner(f"Downloading prices for {len(symbols)} stocks..."):
-        df_all = fetch_batch(symbols, period)
+    if not symbols:
+        st.warning("No symbols found for this universe/filter combination. Try widening your filters.")
+    else:
+        with st.spinner(f"Downloading prices for {len(symbols)} stocks..."):
+            df_all = fetch_batch(symbols, period)
 
-    # Volume filter — runs BEFORE analysis so the count is accurate
-    filtered = filter_by_volume(df_all, symbols, min_avg_vol)
-    if min_avg_vol > 0:
-        st.toast(f"Volume filter: {len(symbols)} → {len(filtered)} stocks (≥{format_volume(min_avg_vol)} avg daily)")
+        # Volume filter — runs BEFORE analysis so the count is accurate
+        filtered = filter_by_volume(df_all, symbols, min_avg_vol)
+        if min_avg_vol > 0:
+            st.toast(f"Volume filter: {len(symbols)} → {len(filtered)} stocks (≥{format_volume(min_avg_vol)} avg daily)")
 
-    action = "Hunting reversals" if scan_mode == "Bottomed Reversals" else "Analyzing"
-    with st.spinner(f"{action} across {len(filtered)} stocks..."):
-        results = analyze_batch(filtered, df_all, min_mcap=0, max_mcap=0)
-        if scan_mode == "Bottomed Reversals":
-            results = filter_bottomed_reversals(results)
-        st.session_state.scan_results = results
-        st.session_state.scan_mode = scan_mode
-        st.session_state.search_data = None
-        st.session_state.scan_performed = True
+        action = "Hunting reversals" if scan_mode == "Bottomed Reversals" else "Analyzing"
+        # For Full Market, mcap was already filtered at NASDAQ API level, so skip here.
+        # For preset lists, apply user-selected mcap filters now.
+        batch_min_mcap = 0 if preset_name == "Full Market (All US Stocks)" else min_mcap
+        batch_max_mcap = 0 if preset_name == "Full Market (All US Stocks)" else max_mcap
+        with st.spinner(f"{action} across {len(filtered)} stocks..."):
+            results = analyze_batch(filtered, df_all, min_mcap=batch_min_mcap, max_mcap=batch_max_mcap, enrich=enrich_batch)
+            if scan_mode == "Bottomed Reversals":
+                results = filter_bottomed_reversals(results)
+            st.session_state.scan_results = results
+            st.session_state.scan_mode = scan_mode
+            st.session_state.search_data = None
+            st.session_state.scan_performed = True
 
 # ── Render content ──
 
@@ -1831,19 +2309,23 @@ elif st.session_state.scan_results:
     total_before_filters = len(st.session_state.scan_results)
     results = st.session_state.scan_results
 
-    # ── Live post-filters (applied on every rerun so changing dropdowns works) ──
-    # Volume and reversal score can always be post-filtered (data is in the results).
-    # Market cap post-filter only works if market_cap was fetched — for Full Market scans
-    # it's already filtered at the NASDAQ API level and not stored per-result.
-    if min_avg_vol > 0:
-        results = [r for r in results if r.get("avg_volume", 0) >= min_avg_vol]
-    if min_rev_score > 0:
-        results = [r for r in results if r["reversal"]["reversal_score"] >= min_rev_score]
+    # ── Live post-filters (applied on every rerun so changing filter controls works) ──
+    results = _apply_post_filters(results,
+        min_avg_vol=min_avg_vol, min_rev_score=min_rev_score,
+        flt_min_price=flt_min_price, flt_max_price=flt_max_price,
+        flt_rsi_min=flt_rsi_min, flt_rsi_max=flt_rsi_max,
+        flt_min_drawdown=flt_min_drawdown,
+        flt_min_5d_ret=flt_min_5d_ret, flt_max_20d_ret=flt_max_20d_ret,
+        flt_require_combo=flt_require_combo,
+        flt_min_confluence=flt_min_confluence, flt_min_mtf=flt_min_mtf,
+        flt_divergence=flt_divergence, flt_vol_profile=flt_vol_profile,
+    )
+    results = _sort_results(results, flt_sort_by)
 
     combo_confirmed = [r for r in results if len(r["combos"]) > 0]
     is_reversal_mode = st.session_state.get("scan_mode") == "Bottomed Reversals"
 
-    # Active filters display
+    # Active filters display — build list of all non-default filters
     active_filters = []
     if is_reversal_mode:
         active_filters.append("Bottomed Reversals")
@@ -1853,8 +2335,34 @@ elif st.session_state.scan_results:
         active_filters.append(f"MCap ≤ {format_market_cap(max_mcap)}")
     if min_avg_vol > 0:
         active_filters.append(f"Vol ≥ {format_volume(min_avg_vol)}")
+    if flt_min_price > 0:
+        active_filters.append(f"Price ≥ ${flt_min_price:.0f}")
+    if flt_max_price > 0:
+        active_filters.append(f"Price ≤ ${flt_max_price:.0f}")
     if min_rev_score > 0:
         active_filters.append(f"Rev ≥ {min_rev_score}")
+    if flt_rsi_min > 0:
+        active_filters.append(f"RSI ≥ {flt_rsi_min}")
+    if flt_rsi_max < 100:
+        active_filters.append(f"RSI ≤ {flt_rsi_max}")
+    if flt_min_drawdown > 0:
+        active_filters.append(f"DD ≥ {flt_min_drawdown}%")
+    if flt_min_5d_ret > -999:
+        active_filters.append(f"5d ≥ {flt_min_5d_ret:+.0f}%")
+    if flt_max_20d_ret < 999:
+        active_filters.append(f"20d ≤ {flt_max_20d_ret:+.0f}%")
+    if flt_require_combo:
+        active_filters.append("Combo Required")
+    if flt_min_confluence > 0:
+        active_filters.append(f"Conf ≥ {flt_min_confluence}/3")
+    if flt_min_mtf > 0:
+        active_filters.append(f"MTF ≥ {flt_min_mtf}")
+    if flt_divergence != "Any":
+        active_filters.append(flt_divergence)
+    if flt_vol_profile != "Any":
+        active_filters.append(flt_vol_profile)
+    if flt_sort_by != "Reversal Score":
+        active_filters.append(f"Sort: {flt_sort_by}")
 
     # Show filter effect — prominent bar so user sees filter is working
     filtered_count = len(results)
@@ -1933,20 +2441,49 @@ elif st.session_state.scan_results:
         </div>
         """, unsafe_allow_html=True)
 
-    # Results table
-    df_table = render_scan_results_table(results)
+    # Results table — compact/extended toggle
+    _tbl_cols = st.columns([3, 1])
+    with _tbl_cols[1]:
+        show_extended = st.checkbox("Show extended columns", value=False, key="show_ext_cols")
+
+    df_table = render_scan_results_table(results, show_extended=show_extended)
     if df_table is not None:
+        col_config = {
+            "Price": st.column_config.NumberColumn(format="$%.2f"),
+            "Rev Score": st.column_config.ProgressColumn(min_value=0, max_value=100, format="%d"),
+        }
+        if show_extended:
+            col_config["5d%"] = st.column_config.NumberColumn(format="%.1f%%")
+            col_config["20d%"] = st.column_config.NumberColumn(format="%.1f%%")
+
         st.dataframe(
             df_table,
-            use_container_width=True,
+            width="stretch",
             height=min(400, 40 + len(df_table) * 35),
-            column_config={
-                "Price": st.column_config.NumberColumn(format="$%.2f"),
-                "5d%": st.column_config.NumberColumn(format="%.1f%%"),
-                "20d%": st.column_config.NumberColumn(format="%.1f%%"),
-                "Rev Score": st.column_config.ProgressColumn(min_value=0, max_value=100, format="%d"),
-            },
+            column_config=col_config,
         )
+
+        # CSV export + Quick add to watchlist
+        _action_cols = st.columns([1, 1, 2])
+        with _action_cols[0]:
+            csv_data = df_table.to_csv(index=False)
+            ts = datetime.now().strftime("%Y%m%d_%H%M")
+            st.download_button(
+                "Download CSV",
+                data=csv_data,
+                file_name=f"alpha_predator_scan_{ts}.csv",
+                mime="text/csv",
+            )
+        with _action_cols[1]:
+            wl_syms = [r["symbol"] for r in results]
+            wl_pick = st.selectbox("Symbol", wl_syms, key="quick_wl_pick", label_visibility="collapsed")
+        with _action_cols[2]:
+            if st.button("Add to Watchlist", key="quick_wl_add") and wl_pick:
+                ok = _watchlist.add_to_watchlist(wl_pick)
+                if ok:
+                    st.toast(f"Added {wl_pick} to watchlist")
+                else:
+                    st.toast(f"{wl_pick} already on watchlist")
 
     # Symbol selector for detail view
     if results:
@@ -1958,6 +2495,24 @@ elif st.session_state.scan_results:
     else:
         selected_data = None
     if selected_data:
+        # Navigation: Back to top + Prev/Next symbol
+        _nav_cols = st.columns([1, 1, 1, 3])
+        with _nav_cols[0]:
+            if st.button("Back to Results", key="nav_back"):
+                st.session_state.selected_symbol = None
+                st.rerun()
+        cur_idx = symbol_names.index(selected_data["symbol"]) if selected_data["symbol"] in symbol_names else 0
+        with _nav_cols[1]:
+            if cur_idx > 0:
+                if st.button(f"Prev ({symbol_names[cur_idx - 1]})", key="nav_prev"):
+                    st.session_state.selected_symbol = symbol_names[cur_idx - 1]
+                    st.rerun()
+        with _nav_cols[2]:
+            if cur_idx < len(symbol_names) - 1:
+                if st.button(f"Next ({symbol_names[cur_idx + 1]})", key="nav_next"):
+                    st.session_state.selected_symbol = symbol_names[cur_idx + 1]
+                    st.rerun()
+
         st.markdown(f"""
         <div style="display:flex;align-items:baseline;gap:16px;margin-bottom:20px">
             <span style="font-size:32px;font-weight:800;color:#e2e8f0;font-family:'Inter',sans-serif">{selected_data['symbol']}</span>
@@ -1965,6 +2520,66 @@ elif st.session_state.scan_results:
         </div>
         """, unsafe_allow_html=True)
         render_symbol_detail(selected_data)
+
+    # ── Symbol Comparison Mode ──
+    if results and len(results) >= 2:
+        with st.expander("📊 Compare Symbols", expanded=False):
+            cmp_symbols = [r["symbol"] for r in results]
+            cmp_cols = st.columns(2)
+            with cmp_cols[0]:
+                cmp_a = st.selectbox("Symbol A", cmp_symbols, index=0, key="cmp_a")
+            with cmp_cols[1]:
+                cmp_b = st.selectbox("Symbol B", cmp_symbols, index=min(1, len(cmp_symbols) - 1), key="cmp_b")
+
+            data_a = next((r for r in results if r["symbol"] == cmp_a), None)
+            data_b = next((r for r in results if r["symbol"] == cmp_b), None)
+
+            if data_a and data_b and cmp_a != cmp_b:
+                # Side-by-side key metrics
+                st.markdown("**Key Metrics Comparison:**")
+                metric_rows = []
+                for label, fn in [
+                    ("Price", lambda r: f"${r['price']:.2f}"),
+                    ("Rev Score", lambda r: str(r["reversal"]["reversal_score"])),
+                    ("RSI", lambda r: f"{r['reversal']['rsi']:.1f}"),
+                    ("Drawdown", lambda r: f"{r['reversal']['drawdown']:.0f}%"),
+                    ("5d Return", lambda r: f"{r['reversal']['ret_5d']:+.1f}%"),
+                    ("Vol Ratio", lambda r: f"{r['reversal']['vol_ratio']:.1f}x"),
+                    ("Best Combo", lambda r: r["best_combo"]["name"] if r.get("best_combo") else "—"),
+                    ("Weekly Conf", lambda r: f"{r.get('weekly', {}).get('confluence_score', 0)}/3"),
+                ]:
+                    metric_rows.append({"Metric": label, cmp_a: fn(data_a), cmp_b: fn(data_b)})
+                st.dataframe(pd.DataFrame(metric_rows), width="stretch", hide_index=True)
+
+                # Normalized performance overlay
+                st.markdown("**Normalized Performance (rebased to 100):**")
+                df_a = data_a["df"].tail(120).copy()
+                df_b = data_b["df"].tail(120).copy()
+
+                if not df_a.empty and not df_b.empty:
+                    norm_a = df_a["close"] / df_a["close"].iloc[0] * 100
+                    norm_b = df_b["close"] / df_b["close"].iloc[0] * 100
+
+                    cmp_fig = go.Figure()
+                    cmp_fig.add_trace(go.Scatter(
+                        x=df_a["date"], y=norm_a, mode="lines",
+                        name=cmp_a, line=dict(color="#06b6d4", width=2),
+                    ))
+                    cmp_fig.add_trace(go.Scatter(
+                        x=df_b["date"], y=norm_b, mode="lines",
+                        name=cmp_b, line=dict(color="#f59e0b", width=2),
+                    ))
+                    cmp_fig.update_layout(
+                        template="plotly_dark",
+                        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="#080c14",
+                        height=350, margin=dict(l=50, r=50, t=30, b=30),
+                        yaxis=dict(title="Normalized (100 = start)", gridcolor="rgba(30,41,59,0.3)"),
+                        xaxis=dict(gridcolor="rgba(30,41,59,0.3)"),
+                        legend=dict(font=dict(color="#94a3b8"), bgcolor="rgba(17,24,39,0.8)"),
+                    )
+                    st.plotly_chart(cmp_fig, use_container_width=True)
+            elif cmp_a == cmp_b:
+                st.info("Select two different symbols to compare.")
 
     # ── Sector Heatmap ──
     with st.expander("🗺️ Sector Rotation Heatmap", expanded=False):
@@ -1976,7 +2591,7 @@ elif st.session_state.scan_results:
                 "ret_5d": "5d %", "ret_20d": "20d %", "ret_60d": "60d %",
             })
             st.dataframe(
-                hm_df, use_container_width=True, hide_index=True,
+                hm_df, width="stretch", hide_index=True,
                 column_config={
                     "5d %": st.column_config.NumberColumn(format="%.1f%%"),
                     "20d %": st.column_config.NumberColumn(format="%.1f%%"),
@@ -1999,14 +2614,14 @@ elif st.session_state.scan_results:
                 "combo": "Combo", "total": "Signals", "wins": "Wins",
                 "hit_rate": "Hit Rate", "avg_return": "Avg 10d Ret %",
             })
-            st.dataframe(hr_df, use_container_width=True, hide_index=True,
+            st.dataframe(hr_df, width="stretch", hide_index=True,
                          column_config={"Hit Rate": st.column_config.NumberColumn(format="%.0f%%")})
 
         recent = _tracker.get_recent_signals(10)
         if recent:
             st.markdown("**Recent Signals**")
             rec_df = pd.DataFrame(recent)
-            st.dataframe(rec_df, use_container_width=True, hide_index=True)
+            st.dataframe(rec_df, width="stretch", hide_index=True)
 
         if total > 0:
             if st.button("Update forward returns (backfill)"):
@@ -2024,7 +2639,7 @@ elif st.session_state.scan_results:
                 wl_df = pd.DataFrame(wl_items)
                 display_cols = ["symbol", "status", "entry_price", "target_price", "stop_loss", "notes", "added_date"]
                 avail_cols = [c for c in display_cols if c in wl_df.columns]
-                st.dataframe(wl_df[avail_cols], use_container_width=True, hide_index=True)
+                st.dataframe(wl_df[avail_cols], width="stretch", hide_index=True)
             else:
                 st.info("Watchlist empty. Use the 'Add to Watchlist' button in symbol detail view.")
 
@@ -2060,7 +2675,16 @@ elif st.session_state.scan_results:
                     for sym in pos_symbols:
                         try:
                             t = yf.Ticker(sym)
-                            cp = t.fast_info.get("lastPrice") or t.info.get("currentPrice", 0)
+                            cp = 0
+                            try:
+                                cp = t.fast_info.last_price
+                            except Exception:
+                                pass
+                            if not cp:
+                                try:
+                                    cp = t.info.get("currentPrice", 0) or t.info.get("regularMarketPrice", 0)
+                                except Exception:
+                                    pass
                             current_prices[sym] = float(cp) if cp else 0
                         except Exception:
                             current_prices[sym] = 0
@@ -2071,7 +2695,7 @@ elif st.session_state.scan_results:
                 pos_df = pd.DataFrame(enriched)
                 display_cols = ["symbol", "entry_price", "shares", "current_price", "unrealized_pnl_pct", "entry_date"]
                 avail_cols = [c for c in display_cols if c in pos_df.columns]
-                st.dataframe(pos_df[avail_cols], use_container_width=True, hide_index=True)
+                st.dataframe(pos_df[avail_cols], width="stretch", hide_index=True)
             else:
                 st.info("No open positions.")
 
@@ -2093,7 +2717,7 @@ elif st.session_state.scan_results:
                     cl_df = pd.DataFrame(closed)
                     display_cols = ["symbol", "entry_price", "exit_price", "pnl_pct", "entry_date", "exit_date"]
                     avail_cols = [c for c in display_cols if c in cl_df.columns]
-                    st.dataframe(cl_df[avail_cols], use_container_width=True, hide_index=True)
+                    st.dataframe(cl_df[avail_cols], width="stretch", hide_index=True)
             else:
                 st.info("No closed trades yet.")
 
@@ -2143,13 +2767,13 @@ elif st.session_state.scan_results:
 
                 if eq_result["stats"]["total_trades"] > 0:
                     fig = build_equity_chart(eq_result)
-                    st.plotly_chart(fig, use_container_width=True)
+                    st.plotly_chart(fig, width="stretch")
 
                     # Trade log
                     if eq_result["trades"]:
                         st.markdown("**Trade Log:**")
                         trades_df = pd.DataFrame(eq_result["trades"])
-                        st.dataframe(trades_df, use_container_width=True, hide_index=True)
+                        st.dataframe(trades_df, width="stretch", hide_index=True)
                 else:
                     st.info("No trades were generated. Try different parameters or scan a larger universe.")
             else:
@@ -2194,15 +2818,15 @@ else:
         qs_sym = st.text_input("Enter ticker(s)", placeholder="SOFI, RIOT, IONQ...", key="qs_input", label_visibility="collapsed")
         qs_col1, qs_col2 = st.columns(2)
         with qs_col1:
-            qs_analyze = st.button("Analyze Symbol", type="primary", use_container_width=True, key="qs_analyze")
+            qs_analyze = st.button("Analyze Symbol", type="primary", width="stretch", key="qs_analyze")
         with qs_col2:
-            qs_quick_scan = st.button("Quick Scan (High Beta)", use_container_width=True, key="qs_quick")
+            qs_quick_scan = st.button("Quick Scan (High Beta)", width="stretch", key="qs_quick")
 
     if qs_analyze and qs_sym.strip():
         symbols = [s.strip().upper() for s in qs_sym.split(",") if s.strip()]
         if len(symbols) == 1:
             with st.spinner(f"Analyzing {symbols[0]}..."):
-                result = analyze_symbol(symbols[0], "1y")
+                result = analyze_symbol(symbols[0], period)
                 if result:
                     st.session_state.search_data = result
                     st.session_state.selected_symbol = symbols[0]
@@ -2211,10 +2835,14 @@ else:
                     st.error(f"Could not fetch data for {symbols[0]}.")
         else:
             with st.spinner(f"Downloading prices for {len(symbols)} symbols..."):
-                df_all = fetch_batch(symbols, "1y")
-            with st.spinner(f"Analyzing {len(symbols)} symbols..."):
-                results = analyze_batch(symbols, df_all)
+                df_all = fetch_batch(symbols, period)
+            filtered = filter_by_volume(df_all, symbols, min_avg_vol)
+            with st.spinner(f"Analyzing {len(filtered)} symbols..."):
+                results = analyze_batch(filtered, df_all, min_mcap=min_mcap, max_mcap=max_mcap, enrich=enrich_batch)
+                if scan_mode == "Bottomed Reversals":
+                    results = filter_bottomed_reversals(results)
                 st.session_state.scan_results = results
+                st.session_state.scan_mode = scan_mode
                 st.session_state.search_data = None
                 st.session_state.scan_performed = True
                 st.rerun()
@@ -2222,9 +2850,13 @@ else:
     if qs_quick_scan:
         quick_universe = PRESETS["High Beta / Meme"]
         with st.spinner(f"Scanning {len(quick_universe)} high-beta stocks..."):
-            df_all = fetch_batch(quick_universe, "1y")
-            results = analyze_batch(quick_universe, df_all)
+            df_all = fetch_batch(quick_universe, period)
+            filtered = filter_by_volume(df_all, quick_universe, min_avg_vol)
+            results = analyze_batch(filtered, df_all, min_mcap=min_mcap, max_mcap=max_mcap, enrich=enrich_batch)
+            if scan_mode == "Bottomed Reversals":
+                results = filter_bottomed_reversals(results)
             st.session_state.scan_results = results
+            st.session_state.scan_mode = scan_mode
             st.session_state.search_data = None
             st.session_state.scan_performed = True
             st.rerun()

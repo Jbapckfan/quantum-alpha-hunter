@@ -9,6 +9,6 @@ from .analogs import find_historical_analogs
 from .fibonacci import compute_fibonacci_levels
 from .divergence import compute_divergences
 from .volume_profile import compute_volume_profile
-from .max_pain import compute_max_pain_gex
+from .max_pain import compute_max_pain_gex, compute_max_pain_gex_from_chain
 from .multi_timeframe import compute_multi_timeframe_score
 from .edgar_insider import fetch_edgar_insider

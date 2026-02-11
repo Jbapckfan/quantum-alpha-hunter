@@ -72,6 +72,31 @@ def fetch_short_interest(symbol: str) -> Dict[str, Any]:
         logger.exception("Failed to fetch info for %s", symbol)
         return empty
 
+    return parse_short_interest_from_info(info)
+
+
+def parse_short_interest_from_info(info: Dict) -> Dict[str, Any]:
+    """Parse short interest metrics from a pre-fetched ``ticker.info`` dict.
+
+    Parameters
+    ----------
+    info : dict
+        The ``ticker.info`` dict from yfinance.
+
+    Returns same dict as ``fetch_short_interest()``.
+    """
+    empty: Dict[str, Any] = {
+        "short_pct_float": 0.0,
+        "short_ratio": 0.0,
+        "shares_short": 0,
+        "date_short_interest": None,
+        "squeeze_potential": False,
+        "short_signal": "Low",
+    }
+
+    if not info:
+        return empty
+
     try:
         # shortPercentOfFloat from yfinance is already a ratio (e.g. 0.15
         # means 15 %).  Convert to percentage for readability.
@@ -112,7 +137,7 @@ def fetch_short_interest(symbol: str) -> Dict[str, Any]:
         }
 
     except Exception:
-        logger.exception("Error parsing short interest for %s", symbol)
+        logger.exception("Error parsing short interest from info dict")
         return empty
 
 
