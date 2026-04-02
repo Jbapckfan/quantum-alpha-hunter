@@ -679,10 +679,10 @@ class CryptoScanner:
             low_30d = float(df["Low"].iloc[-30:].min())
             vol_24h = float(df["Volume"].iloc[-1]) * current
             vol_avg = float(df["Volume"].iloc[-20:].mean()) * current
-            rsi = float(df["rsi"].iloc[-1]) if "rsi" in df.columns else 50.0
+            rsi = float(engine.df["rsi"].iloc[-1]) if "rsi" in engine.df.columns else 50.0
 
-            ema20 = float(df["ema20"].iloc[-1]) if "ema20" in df.columns else current
-            ema50 = float(df["ema50"].iloc[-1]) if "ema50" in df.columns else current
+            ema20 = float(engine.df["ema20"].iloc[-1]) if "ema20" in engine.df.columns else current
+            ema50 = float(engine.df["ema50"].iloc[-1]) if "ema50" in engine.df.columns else current
 
             # Trend label
             if current > ema20 > ema50:

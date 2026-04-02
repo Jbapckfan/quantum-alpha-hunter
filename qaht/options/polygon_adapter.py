@@ -205,14 +205,22 @@ class PolygonAdapter:
             }
         """
         url = f"{self.base_url}/v3/snapshot/options/{underlying.upper()}"
-        data = await self._get(url, {"limit": "1000"})
+        # Paginate through all results (Polygon caps at 250 per page)
+        all_results: List[dict] = []
+        params = {"limit": "250"}
+        for _ in range(20):  # safety cap: 20 pages = 5,000 contracts max
+            data = await self._get(url, params)
+            page = data.get("results") or []
+            if not isinstance(page, list):
+                break
+            all_results.extend(page)
+            next_url = data.get("next_url")
+            if not next_url:
+                break
+            url = next_url
+            params = {}  # next_url already contains query params
 
-        results = data.get("results") or []
-        if not isinstance(results, list):
-            raise PolygonAPIError(
-                status_code=502,
-                detail="Unexpected options snapshot format",
-            )
+        results = all_results
 
         options: List[dict] = []
         underlying_price: Optional[float] = None

@@ -122,7 +122,9 @@ def target_price_strategies(
             exp_d = date.fromisoformat(leg.expiration)
         except (ValueError, TypeError):
             continue
-        if abs((exp_d - target_d).days) <= max_dte_drift:
+        days_diff = (exp_d - target_d).days
+        # Only include options expiring ON or AFTER the target date, within drift
+        if -max_dte_drift <= days_diff <= max_dte_drift and exp_d >= target_d:
             near.append(leg)
 
     if not near:

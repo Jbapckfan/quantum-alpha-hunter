@@ -92,7 +92,7 @@ from qaht.scoring.position_sizing import KellyPositionSizer
 _WEIGHTS_DIR = Path(__file__).resolve().parent.parent / "signals"
 _STOCK_WEIGHTS_FILE = _WEIGHTS_DIR / "stock_weights.json"
 _CRYPTO_WEIGHTS_FILE = _WEIGHTS_DIR / "crypto_weights.json"
-_WATCHLIST_FILE = Path(os.environ.get("QAHT_WATCHLIST_FILE", "")) or Path(__file__).resolve().parent.parent.parent / "watchlist.json"
+_WATCHLIST_FILE = Path(os.environ["QAHT_WATCHLIST_FILE"]) if os.environ.get("QAHT_WATCHLIST_FILE") else Path(__file__).resolve().parent.parent.parent / "watchlist.json"
 
 # Default stock universe (mid-cap recovery / momentum names)
 DEFAULT_STOCK_UNIVERSE: List[str] = [
@@ -301,12 +301,14 @@ async def high_confidence_plays(min_score: int = Query(70, ge=0)):
             flags = r.get("flags", [])
             ema_bull = r.get("ema_bullish", False)
             macd_bull = r.get("macd_bullish", False)
+            # Flags come from detector as uppercased with spaces (e.g. "RSI THRUST")
+            flags_joined = " ".join(flags).upper()
             bullish_count = sum([
                 ema_bull,
                 macd_bull,
-                "RSI_THRUST" in flags,
-                "VOL_SURGE" in flags or "VOL_UP" in flags,
-                "BIG_DAY" in flags or "MOMENTUM" in flags,
+                "RSI" in flags_joined and "THRUST" in flags_joined,
+                "VOL" in flags_joined and ("SURGE" in flags_joined or "EXPANSION" in flags_joined),
+                "BIG DAY" in flags_joined or "MOMENTUM" in flags_joined,
             ])
 
             if is_early and not_extended and bullish_count >= 3:
@@ -1273,12 +1275,14 @@ app.include_router(scoring_router)
 # Entrypoint
 # ═══════════════════════════════════════════════════════════════════════════
 
-if __name__ == "__main__":
+def run_server():
+    """Entry point for the `qaht-api` console script."""
     import uvicorn
 
-    uvicorn.run(
-        "qaht.api.main:app",
-        host="0.0.0.0",
-        port=8000,
-        reload=True,
-    )
+    host = os.environ.get("API_HOST", "0.0.0.0")
+    port = int(os.environ.get("API_PORT", "8000"))
+    uvicorn.run("qaht.api.main:app", host=host, port=port, reload=True)
+
+
+if __name__ == "__main__":
+    run_server()

@@ -487,7 +487,9 @@ async def build_snapshot_from_polygon(
 
         ema9_val = ema(closes[-30:], 9) if len(closes) >= 9 else None
         ema21_val = ema(closes[-60:], 21) if len(closes) >= 21 else None
-        atr20_val = atr(highs, lows, closes, 20)
+        atr20_raw = atr(highs, lows, closes, 20)
+        # Convert ATR to percentage of price so it matches intraday_range_pct units
+        atr20_val = (atr20_raw / price * 100.0) if atr20_raw and price > 0 else None
 
     if high > 0 and low > 0 and price > 0:
         intraday_range_pct = (high - low) / price * 100.0
