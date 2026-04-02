@@ -874,8 +874,7 @@ class EmpiricalScorer:
         # 11. Tier 1 check (if drawdown data is available)
         tier1_result: Optional[Tier1Result] = None
         if max_drawdown_60d is not None and max_drawdown_20d is not None:
-            vol_20d = snap.rsi_14  # We'll use the Factors table volatility below
-            # Use volatility from the df if we can compute it
+            # Compute volatility from the df
             if len(df) >= 20:
                 returns = np.diff(np.log(df["close"].values[-21:]))
                 vol_20d_computed = float(np.std(returns) * np.sqrt(252))

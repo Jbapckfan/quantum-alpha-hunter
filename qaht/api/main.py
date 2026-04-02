@@ -1203,7 +1203,7 @@ async def empirical_score(ticker: str):
                 for c in result.matched_combos
             ],
             "trap_warnings": [
-                {"trap": t.trap_type, "severity": t.severity, "detail": t.detail}
+                {"signal": t.signal, "solo_lift": t.solo_lift, "mitigated": t.mitigated, "message": t.message}
                 for t in result.trap_warnings
             ] if hasattr(result, "trap_warnings") and result.trap_warnings else [],
             "has_unmitigated_traps": result.has_unmitigated_traps,
