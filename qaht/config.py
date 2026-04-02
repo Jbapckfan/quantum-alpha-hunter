@@ -51,6 +51,61 @@ class ScoringConfig:
     calibration_method: str = "isotonic"
 
 
+@dataclass
+class SignalsConfig:
+    """RZLV signal detection defaults"""
+    min_stock_score: int = 35
+    min_crypto_score: int = 15
+    high_confidence_score: int = 70
+    price_min: float = 0.50
+    price_max: float = 50.0
+    market_cap_min: int = 50_000_000
+    market_cap_max: int = 30_000_000_000
+    min_drawdown_pct: int = 40
+    min_rally_pct: int = 15
+    max_workers: int = 8
+
+
+@dataclass
+class OptionsConfig:
+    """Polygon.io options integration configuration"""
+    polygon_api_key_env: str = "MARKET_API_KEY"
+    default_universe: List[str] = None
+    min_leaps_dte: int = 270
+    leaps_min_trend: float = 0.6
+    zero_dte_refresh_seconds: int = 15
+
+    def __post_init__(self):
+        if self.default_universe is None:
+            self.default_universe = ["SPY", "QQQ", "AAPL", "MSFT", "TSLA", "SMH", "XLF"]
+
+
+@dataclass
+class EmpiricalConfig:
+    """Hedge Fund research-validated settings"""
+    vol_zscore_threshold: float = 2.0
+    tier1_min_score: int = 13
+    tier1_min_drawdown_60d: int = 55
+    tier1_max_rsi: int = 35
+    fake_out_max_vol: float = 4.0
+    falling_knife_max_dd20: int = 50
+    kelly_fraction: float = 0.25
+    max_position_pct: int = 10
+    min_position_pct: int = 2
+    stop_loss_pct: int = 15
+    target1_pct: int = 30
+    target2_pct: int = 50
+    target3_pct: int = 100
+
+
+@dataclass
+class ApiConfig:
+    """API server configuration"""
+    host: str = "0.0.0.0"
+    port: int = 8000
+    cors_origins: str = "*"
+
+
 class ConfigManager:
     """
     Central configuration manager
@@ -151,6 +206,80 @@ class ConfigManager:
             min_samples=section.getint("min_samples", 200),
             cv_folds=section.getint("cv_folds", 5),
             calibration_method=section.get("calibration_method", "isotonic")
+        )
+
+    @property
+    def signals(self) -> SignalsConfig:
+        """RZLV signal detection configuration"""
+        if "signals" not in self._config:
+            return SignalsConfig()
+
+        section = self._config["signals"]
+        return SignalsConfig(
+            min_stock_score=section.getint("min_stock_score", 35),
+            min_crypto_score=section.getint("min_crypto_score", 15),
+            high_confidence_score=section.getint("high_confidence_score", 70),
+            price_min=section.getfloat("price_min", 0.50),
+            price_max=section.getfloat("price_max", 50.0),
+            market_cap_min=section.getint("market_cap_min", 50_000_000),
+            market_cap_max=section.getint("market_cap_max", 30_000_000_000),
+            min_drawdown_pct=section.getint("min_drawdown_pct", 40),
+            min_rally_pct=section.getint("min_rally_pct", 15),
+            max_workers=section.getint("max_workers", 8),
+        )
+
+    @property
+    def options(self) -> OptionsConfig:
+        """Options engine configuration"""
+        if "options" not in self._config:
+            return OptionsConfig()
+
+        section = self._config["options"]
+        universe_str = section.get("default_universe", "SPY,QQQ,AAPL,MSFT,TSLA,SMH,XLF")
+        universe = [s.strip() for s in universe_str.split(",")]
+
+        return OptionsConfig(
+            polygon_api_key_env=section.get("polygon_api_key_env", "MARKET_API_KEY"),
+            default_universe=universe,
+            min_leaps_dte=section.getint("min_leaps_dte", 270),
+            leaps_min_trend=section.getfloat("leaps_min_trend", 0.6),
+            zero_dte_refresh_seconds=section.getint("zero_dte_refresh_seconds", 15),
+        )
+
+    @property
+    def empirical(self) -> EmpiricalConfig:
+        """Empirical combo engine configuration"""
+        if "empirical" not in self._config:
+            return EmpiricalConfig()
+
+        section = self._config["empirical"]
+        return EmpiricalConfig(
+            vol_zscore_threshold=section.getfloat("vol_zscore_threshold", 2.0),
+            tier1_min_score=section.getint("tier1_min_score", 13),
+            tier1_min_drawdown_60d=section.getint("tier1_min_drawdown_60d", 55),
+            tier1_max_rsi=section.getint("tier1_max_rsi", 35),
+            fake_out_max_vol=section.getfloat("fake_out_max_vol", 4.0),
+            falling_knife_max_dd20=section.getint("falling_knife_max_dd20", 50),
+            kelly_fraction=section.getfloat("kelly_fraction", 0.25),
+            max_position_pct=section.getint("max_position_pct", 10),
+            min_position_pct=section.getint("min_position_pct", 2),
+            stop_loss_pct=section.getint("stop_loss_pct", 15),
+            target1_pct=section.getint("target1_pct", 30),
+            target2_pct=section.getint("target2_pct", 50),
+            target3_pct=section.getint("target3_pct", 100),
+        )
+
+    @property
+    def api(self) -> ApiConfig:
+        """API server configuration"""
+        if "api" not in self._config:
+            return ApiConfig()
+
+        section = self._config["api"]
+        return ApiConfig(
+            host=section.get("host", "0.0.0.0"),
+            port=section.getint("port", 8000),
+            cors_origins=section.get("cors_origins", "*"),
         )
 
     def get_universe_symbols(self) -> List[str]:
