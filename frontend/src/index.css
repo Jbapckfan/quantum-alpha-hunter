@@ -1,0 +1,106 @@
+@import "tailwindcss";
+
+:root {
+  /* --- Token System --- */
+  /* Typography */
+  --font-sans: 'DM Sans', system-ui, sans-serif;
+  --font-mono: 'JetBrains Mono', 'Fira Code', monospace;
+  --font-display: 'Space Grotesk', 'DM Sans', system-ui, sans-serif;
+
+  /* Surface palette — deep navy/slate */
+  --surface-950: #06080d;
+  --surface-900: #0b0f18;
+  --surface-800: #131928;
+  --surface-700: #1d2640;
+  --surface-600: #2a3555;
+  --surface-500: #3d4a6b;
+
+  /* Accent palette */
+  --accent-emerald: #00e68a;
+  --accent-cyan: #00d4ff;
+  --accent-amber: #ffb020;
+  --accent-rose: #ff4466;
+  --accent-violet: #a78bfa;
+
+  /* Signal colors */
+  --signal-buy: #00e68a;
+  --signal-sell: #ff4466;
+  --signal-hold: #ffb020;
+  --signal-neutral: #6b7fa3;
+
+  /* Spacing scale */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-8: 32px;
+  --space-10: 40px;
+  --space-12: 48px;
+
+  /* Type scale */
+  --text-xs: 0.75rem;
+  --text-sm: 0.875rem;
+  --text-base: 1rem;
+  --text-lg: 1.125rem;
+  --text-xl: 1.25rem;
+  --text-2xl: 1.5rem;
+  --text-3xl: 1.875rem;
+
+  /* Radius */
+  --radius-sm: 6px;
+  --radius-md: 10px;
+  --radius-lg: 14px;
+  --radius-xl: 20px;
+
+  font-family: var(--font-sans);
+  line-height: 1.5;
+  font-weight: 400;
+  color: #e2e8f0;
+  background-color: var(--surface-950);
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  background: linear-gradient(160deg, var(--surface-950) 0%, var(--surface-900) 40%, #0e1525 100%);
+}
+
+/* Custom scrollbar */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: var(--surface-900);
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--surface-600);
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--surface-500);
+}
+
+/* Keyframes for spinner */
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+@keyframes fadeInUp {
+  from { opacity: 0; transform: translateY(12px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.fade-in-up {
+  animation: fadeInUp 0.35s ease-out forwards;
+}

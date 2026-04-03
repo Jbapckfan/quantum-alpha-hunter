@@ -1,0 +1,19 @@
+services:
+  quantum-alpha-hunter:
+    build: .
+    container_name: quantum-alpha-hunter
+    restart: unless-stopped
+    ports:
+      - "8200:3000"
+    volumes:
+      - ./data:/app/data
+    environment:
+      - QAHT_DB_URL=sqlite:////app/data/qaht.db
+      - QAHT_WATCHLIST_FILE=/app/data/watchlist.json
+      - NTFY_TOPIC=james-qah-alerts
+      - API_HOST=0.0.0.0
+      - API_PORT=3000
+      # Uncomment and set if you have a Polygon.io key
+      # - MARKET_API_KEY=your_key_here
+    mem_limit: 2g
+    cpus: 2
