@@ -112,6 +112,8 @@ STOCK_WEIGHTS: Dict[str, int] = {
     "power_earnings_gap": 12,          # Gap up on earnings with volume
     "pocket_pivot": 12,                # Up day vol > any prior down day vol
     "shakeout_rally": 10,              # False breakdown followed by recovery
+    "earnings_catalyst": 15,           # Technical setup with earnings catalyst in 5-14d window
+    "earnings_imminent_warning": -5,   # Earnings too close for a straightforward stock swing
 
     # === RISK / REWARD ADJUSTMENTS ===
     "rr_excellent": 10,                # R:R > 5:1

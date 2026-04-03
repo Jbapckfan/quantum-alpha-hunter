@@ -2,9 +2,9 @@
 Database schemas for Quantum Alpha Hunter
 Shared tables + vertical-specific tables (equities/options + crypto)
 """
-from sqlalchemy import String, Float, Integer, Boolean, JSON, ForeignKey
+
+from sqlalchemy import Boolean, Float, ForeignKey, Integer, JSON, String
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
-from datetime import date
 
 
 class Base(DeclarativeBase):
@@ -188,6 +188,76 @@ class NewsEvents(Base):
     date: Mapped[str] = mapped_column(String, primary_key=True)
     source: Mapped[str] = mapped_column(String, primary_key=True)
     headline: Mapped[str] = mapped_column(String, primary_key=True)
+
+
+class AlertHistory(Base):
+    """Stored alert events for dedupe, rate limiting, and API history."""
+    __tablename__ = "alert_history"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    ticker: Mapped[str] = mapped_column(String, index=True)
+    alert_type: Mapped[str] = mapped_column(String, index=True)
+    timestamp: Mapped[str] = mapped_column(String, index=True)
+    data: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class SignalEvent(Base):
+    """A single signal firing captured at scan time for later outcome analysis."""
+    __tablename__ = "signal_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    ticker: Mapped[str] = mapped_column(String, index=True)
+    signal_name: Mapped[str] = mapped_column(String, index=True)
+    fired_date: Mapped[str] = mapped_column(String, index=True)
+    entry_price: Mapped[float] = mapped_column(Float)
+    score_at_fire: Mapped[float] = mapped_column(Float)
+    combo_matched: Mapped[str | None] = mapped_column(String, nullable=True)
+    stop_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    t1_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    t2_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    t3_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    context: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    completed: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    completed_at: Mapped[str | None] = mapped_column(String, nullable=True)
+
+    outcomes: Mapped[list["SignalOutcome"]] = relationship(
+        back_populates="event",
+        cascade="all, delete-orphan",
+    )
+
+
+class SignalOutcome(Base):
+    """Periodic outcome checkpoints for a fired signal."""
+    __tablename__ = "signal_outcomes"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    event_id: Mapped[int] = mapped_column(ForeignKey("signal_events.id"), index=True)
+    check_date: Mapped[str] = mapped_column(String, index=True)
+    price_at_check: Mapped[float] = mapped_column(Float)
+    return_pct: Mapped[float] = mapped_column(Float)
+    hit_t1: Mapped[bool] = mapped_column(Boolean, default=False)
+    hit_t2: Mapped[bool] = mapped_column(Boolean, default=False)
+    hit_t3: Mapped[bool] = mapped_column(Boolean, default=False)
+    hit_stop: Mapped[bool] = mapped_column(Boolean, default=False)
+    days_elapsed: Mapped[int] = mapped_column(Integer)
+    final: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+
+    event: Mapped["SignalEvent"] = relationship(back_populates="outcomes")
+
+
+class BacktestRun(Base):
+    """Serialized backtest run payloads for later comparison."""
+    __tablename__ = "backtest_runs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    created_at: Mapped[str] = mapped_column(String, index=True)
+    start_date: Mapped[str] = mapped_column(String)
+    end_date: Mapped[str] = mapped_column(String)
+    initial_capital: Mapped[float] = mapped_column(Float)
+    tickers: Mapped[list] = mapped_column(JSON, default=list)
+    metrics: Mapped[dict] = mapped_column(JSON, default=dict)
+    equity_curve: Mapped[list] = mapped_column(JSON, default=list)
+    trades: Mapped[list] = mapped_column(JSON, default=list)
 
 
 # ============================================================================

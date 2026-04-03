@@ -41,7 +41,7 @@ tar czf - \
 
 # Build and start container
 echo "[4/4] Building and starting container..."
-ssh ${TARS_USER}@${TARS_HOST} "cd ${TARS_PATH} && docker compose up -d --build"
+ssh ${TARS_USER}@${TARS_HOST} "bash -lc 'cd ${TARS_PATH} && docker compose up -d --build'"
 
 echo ""
 echo "=== Deployed! ==="

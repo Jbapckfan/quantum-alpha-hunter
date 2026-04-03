@@ -852,22 +852,71 @@ class StockSignalDetector:
         wf = weights_file or WEIGHTS_FILE
         self.weights: Dict[str, int] = weights or load_weights(wf, STOCK_WEIGHTS)
 
-    # ----- single ticker scan -----------------------------------------------
+    @staticmethod
+    def _normalize_history(df: pd.DataFrame) -> pd.DataFrame:
+        """Normalize yfinance output to a clean OHLCV DataFrame."""
+        if isinstance(df.columns, pd.MultiIndex):
+            df = df.copy()
+            df.columns = [str(col[0]) for col in df.columns]
 
-    def scan(self, ticker: str, spy_df: Optional[pd.DataFrame] = None) -> Optional[Dict[str, Any]]:
-        """
-        Perform a full scan of *ticker* and return a result dict, or ``None``
-        if the ticker is ineligible (insufficient data, price filters, etc.).
-        """
+        rename_map = {
+            "open": "Open",
+            "high": "High",
+            "low": "Low",
+            "close": "Close",
+            "volume": "Volume",
+        }
+        df = df.rename(columns=rename_map)
+        keep = [col for col in ["Open", "High", "Low", "Close", "Volume"] if col in df.columns]
+        if keep:
+            df = df[keep].copy()
+        df = df.dropna(subset=[col for col in ["Open", "High", "Low", "Close"] if col in df.columns])
+        if not df.index.is_monotonic_increasing:
+            df = df.sort_index()
+        return df
+
+    def _fetch_history(self, ticker: str, timeframe: str = "1d") -> pd.DataFrame:
+        """Fetch history for the requested timeframe."""
+        ticker = ticker.upper()
+        if timeframe == "1wk":
+            data = yf.download(ticker, period="2y", interval="1wk", progress=False, auto_adjust=False)
+            return self._normalize_history(data)
+        if timeframe == "4h":
+            data = yf.download(ticker, period="60d", interval="1h", progress=False, auto_adjust=False)
+            data = self._normalize_history(data)
+            if data.empty:
+                return data
+            resampled = data.resample("4H").agg(
+                {
+                    "Open": "first",
+                    "High": "max",
+                    "Low": "min",
+                    "Close": "last",
+                    "Volume": "sum",
+                }
+            )
+            return resampled.dropna(subset=["Open", "High", "Low", "Close"])
+
+        stock = yf.Ticker(ticker)
+        data = stock.history(period="1y", interval="1d")
+        return self._normalize_history(data)
+
+    def _scan_dataframe(
+        self,
+        ticker: str,
+        df: pd.DataFrame,
+        info: Optional[Dict[str, Any]] = None,
+        spy_df: Optional[pd.DataFrame] = None,
+        timeframe: str = "1d",
+    ) -> Optional[Dict[str, Any]]:
+        """Run the stock scan against a supplied OHLCV history."""
         try:
-            stock = yf.Ticker(ticker)
-            df = stock.history(period="1y", interval="1d")
-
+            df = self._normalize_history(df)
             if df.empty or len(df) < 60:
                 logger.debug("%s: insufficient data (%d bars)", ticker, len(df))
                 return None
 
-            info = stock.info or {}
+            info = info or {}
             current = float(df.iloc[-1]["Close"])
 
             # --- run signal detection ---
@@ -969,6 +1018,7 @@ class StockSignalDetector:
                 "ema_bullish": details.get("ema_bullish", False),
                 "macd_bullish": details.get("macd_bullish", False),
                 "stage": details.get("stage", "UNKNOWN"),
+                "timeframe": timeframe,
                 "stop": round(stop, 2),
                 "R": round(r_unit, 3),
                 "t1": round(current + 2 * r_unit, 2),
@@ -987,6 +1037,73 @@ class StockSignalDetector:
             logger.warning("Failed to scan %s", ticker, exc_info=True)
             return None
 
+    # ----- single ticker scan -----------------------------------------------
+
+    def scan(
+        self,
+        ticker: str,
+        spy_df: Optional[pd.DataFrame] = None,
+        timeframe: str = "1d",
+        data: Optional[pd.DataFrame] = None,
+        info: Optional[Dict[str, Any]] = None,
+        include_multiframe: bool = True,
+        apply_earnings: bool = True,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Perform a full scan of *ticker* and return a result dict, or ``None``
+        if the ticker is ineligible (insufficient data, price filters, etc.).
+        """
+        try:
+            ticker = ticker.upper()
+            resolved_data = data
+            resolved_info = info
+            if resolved_data is None:
+                stock = yf.Ticker(ticker)
+                resolved_data = self._fetch_history(ticker, timeframe=timeframe)
+                resolved_info = resolved_info or (stock.info or {})
+
+            result = self._scan_dataframe(
+                ticker=ticker.upper(),
+                df=resolved_data,
+                info=resolved_info,
+                spy_df=spy_df,
+                timeframe=timeframe,
+            )
+            if result is None:
+                return None
+
+            if timeframe == "1d" and apply_earnings:
+                result = self._apply_earnings_context(ticker, result)
+
+            if timeframe == "1d" and include_multiframe and data is None:
+                result = self._apply_multiframe_context(ticker, result)
+
+            return result
+        except Exception:
+            logger.warning("Failed to scan %s", ticker, exc_info=True)
+            return None
+
+    def scan_from_history(
+        self,
+        ticker: str,
+        df: pd.DataFrame,
+        info: Optional[Dict[str, Any]] = None,
+        spy_df: Optional[pd.DataFrame] = None,
+        timeframe: str = "1d",
+        include_multiframe: bool = False,
+        apply_earnings: bool = False,
+    ) -> Optional[Dict[str, Any]]:
+        """Run a scan using caller-supplied history instead of fetching live data."""
+        return self.scan(
+            ticker=ticker.upper(),
+            spy_df=spy_df,
+            timeframe=timeframe,
+            data=df,
+            info=info,
+            include_multiframe=include_multiframe,
+            apply_earnings=apply_earnings,
+        )
+
     # ----- multi-ticker scan ------------------------------------------------
 
     def scan_universe(
@@ -994,6 +1111,9 @@ class StockSignalDetector:
         tickers: List[str],
         min_score: int = 35,
         max_workers: int = 8,
+        timeframe: str = "1d",
+        include_multiframe: bool = False,
+        apply_earnings: bool = True,
     ) -> List[Dict[str, Any]]:
         """
         Scan a list of tickers in parallel and return results sorted by score
@@ -1003,7 +1123,19 @@ class StockSignalDetector:
         spy_df = _get_cached_spy_data()
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {executor.submit(self.scan, t, spy_df): t for t in tickers}
+            futures = {
+                executor.submit(
+                    self.scan,
+                    t,
+                    spy_df,
+                    timeframe,
+                    None,
+                    None,
+                    include_multiframe,
+                    apply_earnings,
+                ): t
+                for t in tickers
+            }
             for future in as_completed(futures):
                 result = future.result()
                 if result and result["score"] >= min_score:
@@ -1022,3 +1154,65 @@ class StockSignalDetector:
         """Merge *updates* into current weights and persist."""
         self.weights.update(updates)
         save_weights(WEIGHTS_FILE, self.weights)
+
+    def _apply_earnings_context(self, ticker: str, result: Dict[str, Any]) -> Dict[str, Any]:
+        """Add earnings-aware score adjustments and metadata."""
+        try:
+            from .earnings import EarningsAnalyzer
+
+            analyzer = EarningsAnalyzer()
+            context = analyzer.compute_earnings_context(ticker)
+            result["earnings_context"] = context.to_dict()
+
+            days_until = context.days_until
+            flags = list(result.get("flags", []))
+            breakdown = result.setdefault("signal_breakdown", {})
+            score = float(result.get("score", 0.0))
+
+            if (
+                days_until is not None
+                and 5 <= days_until <= 14
+                and score > 100
+                and result.get("stage") in {"EARLY", "MID"}
+            ):
+                weight = float(self.weights.get("earnings_catalyst", 15))
+                result["score"] = int(round(score + weight))
+                breakdown["earnings_catalyst"] = weight
+                flags.append("EARNINGS CATALYST")
+
+            if days_until is not None and 0 <= days_until <= 2:
+                weight = float(self.weights.get("earnings_imminent_warning", -5))
+                result["score"] = int(round(float(result["score"]) + weight))
+                breakdown["earnings_imminent_warning"] = weight
+                flags.append("EARNINGS IMMINENT")
+
+            result["flags"] = list(dict.fromkeys(flags))
+            return result
+        except Exception:
+            logger.debug("Failed to apply earnings context for %s", ticker, exc_info=True)
+            return result
+
+    def _apply_multiframe_context(self, ticker: str, result: Dict[str, Any]) -> Dict[str, Any]:
+        """Apply the multi-timeframe alignment multiplier to the final score."""
+        try:
+            from .multiframe import MultiFrameAnalyzer
+
+            analyzer = MultiFrameAnalyzer()
+            multiframe = analyzer.analyze(ticker)
+            multiplier = float(multiframe.get("multiplier", 1.0))
+            if multiplier != 1.0:
+                base_score = float(result.get("score", 0.0))
+                delta = base_score * (multiplier - 1.0)
+                key = "multiframe_bonus" if delta >= 0 else "multiframe_penalty"
+                result.setdefault("signal_breakdown", {})[key] = round(delta, 2)
+                result["score"] = int(round(base_score * multiplier))
+
+            result["multiframe"] = multiframe
+            if multiframe.get("flag"):
+                flags = list(result.get("flags", []))
+                flags.append("MTF_ALIGNED")
+                result["flags"] = list(dict.fromkeys(flags))
+            return result
+        except Exception:
+            logger.debug("Failed to apply multi-timeframe context for %s", ticker, exc_info=True)
+            return result

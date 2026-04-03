@@ -34,8 +34,8 @@ from pydantic import BaseModel, Field
 
 app = FastAPI(
     title="Quantum Alpha Hunter API",
-    description="Unified backend for equities scanning, crypto scanning, options, and empirical scoring.",
-    version="2.0.0",
+    description="Unified backend for scanning, alerts, tracking, backtesting, options flow, earnings context, and AI thesis generation.",
+    version="2.1.0",
 )
 
 app.add_middleware(
@@ -54,6 +54,8 @@ logger = logging.getLogger("qaht.api")
 
 # Stock scanning
 from qaht.signals.detector import StockSignalDetector
+from qaht.signals.earnings import EarningsAnalyzer
+from qaht.signals.multiframe import MultiFrameAnalyzer
 from qaht.signals.resistance import ResistanceAnalyzer
 from qaht.signals.weights import (
     STOCK_WEIGHTS,
@@ -69,6 +71,7 @@ from qaht.signals.crypto_detector import CryptoScanner, DEFAULT_CRYPTO_UNIVERSE
 # Options (async -- uses Polygon adapter)
 from qaht.options.polygon_adapter import PolygonAdapter
 from qaht.options.chain import fetch_and_parse, ParsedChain
+from qaht.options.flow_detector import FlowDetector
 from qaht.options.zero_dte import (
     compute_scores as compute_0dte_scores,
     build_snapshot_from_polygon,
@@ -84,6 +87,11 @@ from qaht.options.strategies import (
 # Empirical scoring
 from qaht.scoring.empirical_combos import EmpiricalScorer
 from qaht.scoring.position_sizing import KellyPositionSizer
+from qaht.alerts.scheduler import AlertScheduler
+from qaht.tracking.outcome_tracker import OutcomeTracker
+from qaht.tracking.weight_tuner import WeightTuner
+from qaht.backtest.simulator import BacktestSimulator
+from qaht.ai.thesis_generator import ThesisGenerator
 
 # ---------------------------------------------------------------------------
 # Config paths
@@ -103,6 +111,8 @@ DEFAULT_STOCK_UNIVERSE: List[str] = [
     "SMCI", "NVDA", "AMD", "MU", "MARA", "RIOT", "COIN", "HOOD",
     "SNAP", "PINS", "TTWO", "RBLX", "U", "SHOP", "SQ", "PYPL",
 ]
+
+_ALERT_SCHEDULER = AlertScheduler(DEFAULT_STOCK_UNIVERSE)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -180,6 +190,13 @@ class PositionSizeRequest(BaseModel):
     avg_loss: float = Field(default=0.15, gt=0.0)
 
 
+class BacktestRunRequest(BaseModel):
+    tickers: List[str]
+    start: str
+    end: str
+    capital: float = Field(default=100000.0, gt=0.0)
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Helpers
 # ═══════════════════════════════════════════════════════════════════════════
@@ -255,8 +272,20 @@ def _dataclass_to_dict(obj: Any) -> Any:
 async def root():
     return {
         "name": "Quantum Alpha Hunter API",
-        "version": "2.0.0",
-        "verticals": ["scan", "watchlist", "weights", "crypto", "options", "scoring"],
+        "version": "2.1.0",
+        "verticals": [
+            "scan",
+            "watchlist",
+            "weights",
+            "crypto",
+            "options",
+            "scoring",
+            "alerts",
+            "tracking",
+            "backtest",
+            "thesis",
+            "earnings",
+        ],
     }
 
 
@@ -387,6 +416,228 @@ async def stock_quote(ticker: str):
         raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
+
+
+analysis_router = APIRouter(prefix="/api/analyze", tags=["Stock Scanner"])
+
+
+@analysis_router.get("/{ticker}/multiframe")
+async def analyze_multiframe(ticker: str):
+    """Weekly/daily/4H alignment analysis for a single ticker."""
+    try:
+        analyzer = MultiFrameAnalyzer()
+        return analyzer.get_timeframe_breakdown(ticker.upper())
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+app.include_router(analysis_router)
+
+
+@app.get("/api/thesis/{ticker}", tags=["AI"])
+async def thesis_for_ticker(ticker: str):
+    """Generate a concise AI thesis for a ticker using scan + resistance context."""
+    try:
+        import yfinance as yf  # noqa: PLC0415
+
+        ticker = ticker.upper()
+        detector = StockSignalDetector()
+        scan_result = detector.scan(ticker)
+        if not scan_result:
+            raise HTTPException(status_code=404, detail=f"Could not analyze {ticker}")
+
+        resistance = ResistanceAnalyzer(ticker).find_all_levels()
+        history = yf.Ticker(ticker).history(period="1y", interval="1d")
+        combo_result = None
+        if not history.empty:
+            scorer = EmpiricalScorer()
+            history = history.rename(
+                columns={
+                    "Open": "open",
+                    "High": "high",
+                    "Low": "low",
+                    "Close": "close",
+                    "Volume": "volume",
+                }
+            )[["open", "high", "low", "close", "volume"]]
+            combo_result = scorer.score_symbol(
+                symbol=ticker,
+                df=history.reset_index(drop=True),
+                quantum_score=int(scan_result["score"]),
+                entry_price=float(scan_result["price"]),
+            )
+
+        combo_payload = None
+        if combo_result is not None:
+            combo_payload = {
+                "name": combo_result.matched_combos[0].name if combo_result.matched_combos else None,
+                "best_combo_hit_rate": combo_result.best_combo_hit_rate,
+                "matched_combos": [
+                    {"name": combo.name, "hit_rate": combo.hit_rate}
+                    for combo in combo_result.matched_combos
+                ],
+                "trap_warnings": [
+                    getattr(trap, "message", str(trap))
+                    for trap in combo_result.trap_warnings
+                ],
+            }
+
+        thesis = ThesisGenerator().generate(
+            scan_result=scan_result,
+            resistance_levels=resistance,
+            combo_result=combo_payload,
+        )
+
+        return {
+            "ticker": ticker,
+            "thesis": thesis,
+            "scan": scan_result,
+            "resistance": resistance,
+            "combo": combo_payload,
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ALERTS  /api/alerts
+# ═══════════════════════════════════════════════════════════════════════════
+
+alerts_router = APIRouter(prefix="/api/alerts", tags=["Alerts"])
+
+
+@alerts_router.get("/status")
+async def alert_status():
+    """Current alert scheduler state."""
+    try:
+        return _ALERT_SCHEDULER.get_status()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@alerts_router.post("/start")
+async def start_alerts():
+    """Start the background alert scheduler."""
+    try:
+        return _ALERT_SCHEDULER.start()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@alerts_router.post("/stop")
+async def stop_alerts():
+    """Stop the background alert scheduler."""
+    try:
+        return _ALERT_SCHEDULER.stop()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@alerts_router.get("/history")
+async def alert_history(limit: int = Query(50, ge=1, le=250)):
+    """Recent alert history."""
+    try:
+        return {
+            "total": min(limit, len(_ALERT_SCHEDULER.get_history(limit=limit))),
+            "results": _ALERT_SCHEDULER.get_history(limit=limit),
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+app.include_router(alerts_router)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TRACKING  /api/tracking
+# ═══════════════════════════════════════════════════════════════════════════
+
+tracking_router = APIRouter(prefix="/api/tracking", tags=["Tracking"])
+
+
+@tracking_router.get("/stats")
+async def tracking_stats(lookback_days: int = Query(90, ge=7, le=365)):
+    """Per-signal hit rates and returns."""
+    try:
+        tracker = OutcomeTracker()
+        rows = tracker.get_signal_stats(lookback_days=lookback_days)
+        return {
+            "lookback_days": lookback_days,
+            "total_signals": len(rows),
+            "results": rows,
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@tracking_router.get("/drift")
+async def tracking_drift(lookback_days: int = Query(90, ge=7, le=365)):
+    """Weight drift versus baseline stock weights."""
+    try:
+        tuner = WeightTuner()
+        report = tuner.get_weight_drift_report(lookback_days=lookback_days)
+        return {
+            "lookback_days": lookback_days,
+            "total": len(report),
+            "results": report,
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@tracking_router.post("/tune")
+async def tracking_tune(lookback_days: int = Query(90, ge=7, le=365)):
+    """Apply tuned weights from recent tracked outcomes."""
+    try:
+        tuner = WeightTuner()
+        return tuner.apply_tuned_weights(lookback_days=lookback_days)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+app.include_router(tracking_router)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# EARNINGS  /api/earnings
+# ═══════════════════════════════════════════════════════════════════════════
+
+earnings_router = APIRouter(prefix="/api/earnings", tags=["Earnings"])
+
+
+@earnings_router.get("/upcoming")
+async def upcoming_earnings(days: int = Query(14, ge=1, le=60)):
+    """Upcoming earnings for the default stock universe."""
+    try:
+        analyzer = EarningsAnalyzer()
+        results = analyzer.get_upcoming_earnings(DEFAULT_STOCK_UNIVERSE, days_ahead=days)
+        return {
+            "days_ahead": days,
+            "total": len(results),
+            "results": results,
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@earnings_router.get("/{ticker}")
+async def earnings_detail(ticker: str):
+    """Detailed earnings context for a single ticker."""
+    try:
+        analyzer = EarningsAnalyzer()
+        context = analyzer.compute_earnings_context(ticker.upper())
+        return {
+            "ticker": ticker.upper(),
+            "context": context.to_dict(),
+            "iv_crush": analyzer.estimate_iv_crush(ticker.upper(), context=context),
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+app.include_router(earnings_router)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1007,6 +1258,32 @@ app.include_router(crypto_router)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# BACKTEST  /api/backtest
+# ═══════════════════════════════════════════════════════════════════════════
+
+backtest_router = APIRouter(prefix="/api/backtest", tags=["Backtest"])
+
+
+@backtest_router.post("/run")
+async def run_backtest(body: BacktestRunRequest):
+    """Run a walk-forward backtest and persist the result."""
+    try:
+        simulator = BacktestSimulator()
+        results = simulator.run(
+            tickers=[ticker.upper() for ticker in body.tickers],
+            start_date=body.start,
+            end_date=body.end,
+            initial_capital=body.capital,
+        )
+        return results
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+app.include_router(backtest_router)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # OPTIONS  /api/options
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -1031,6 +1308,33 @@ async def options_chain(
             "expirations": chain.expirations,
             "total_contracts": len(chain.legs),
             "options": legs_dicts,
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+
+
+@options_router.get("/flow")
+async def options_flow(
+    min_score: int = Query(3, ge=0, le=20),
+    tickers: Optional[str] = Query(None, description="Comma-separated tickers. Uses default stock universe if omitted."),
+):
+    """Rank unusual options flow by aggregate anomaly score."""
+    adapter = _get_polygon_adapter()
+    universe = (
+        [ticker.strip().upper() for ticker in tickers.split(",") if ticker.strip()]
+        if tickers
+        else DEFAULT_STOCK_UNIVERSE[:15]
+    )
+
+    try:
+        detector = FlowDetector(adapter=adapter)
+        alerts = await detector.scan_unusual_activity(universe, min_score=min_score)
+        return {
+            "min_score": min_score,
+            "total": len(alerts),
+            "results": [alert.to_dict() for alert in alerts],
         }
     except HTTPException:
         raise
