@@ -1272,6 +1272,26 @@ app.include_router(scoring_router)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# Static frontend (serves built React app in production)
+# ═══════════════════════════════════════════════════════════════════════════
+
+_FRONTEND_DIR = Path(__file__).resolve().parent.parent.parent / "frontend" / "dist"
+if _FRONTEND_DIR.is_dir():
+    from fastapi.staticfiles import StaticFiles
+    from fastapi.responses import FileResponse
+
+    @app.get("/app/{full_path:path}")
+    async def serve_spa(full_path: str):
+        """Serve the React SPA — all routes fall back to index.html."""
+        file_path = _FRONTEND_DIR / full_path
+        if file_path.is_file():
+            return FileResponse(file_path)
+        return FileResponse(_FRONTEND_DIR / "index.html")
+
+    app.mount("/assets", StaticFiles(directory=str(_FRONTEND_DIR / "assets")), name="assets")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # Entrypoint
 # ═══════════════════════════════════════════════════════════════════════════
 
