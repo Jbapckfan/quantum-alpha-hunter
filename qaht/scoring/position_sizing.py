@@ -36,6 +36,12 @@ DEFAULT_TARGETS: List[Tuple[float, float]] = [
     (1.00, 0.50),   # T3: +100% -> trail remaining 50%
 ]
 
+MAX_TOTAL_PORTFOLIO_ALLOCATION = 0.30
+MAX_POSITIONS_PER_SECTOR = 3
+HIGH_CORRELATION_THRESHOLD = 0.70
+MAX_CORRELATION_SIZE_CUT = 0.50
+VAR_ZSCORE_95 = 1.65
+
 
 # ---------------------------------------------------------------------------
 # Kelly Criterion
@@ -157,6 +163,33 @@ class ExitPlan:
     reward_risk_ratio: float
 
 
+@dataclass
+class PortfolioPosition:
+    """Tracked portfolio position used by PortfolioRiskManager."""
+
+    symbol: str
+    weight: float
+    sector: str
+    volatility: float
+    correlations: Dict[str, float] = field(default_factory=dict)
+
+
+@dataclass
+class PositionDecision:
+    """Sizing decision for a proposed portfolio position."""
+
+    symbol: str
+    requested_weight: float
+    approved_weight: float
+    sector: str
+    total_exposure: float
+    remaining_capacity: float
+    sector_count: int
+    correlation_multiplier: float
+    accepted: bool
+    reasons: List[str] = field(default_factory=list)
+
+
 class ProfitTargetCalculator:
     """
     Multi-target exit strategy derived from explosive scanner backtests.
@@ -272,3 +305,197 @@ class ProfitTargetCalculator:
                 }
 
         return None
+
+
+class PortfolioRiskManager:
+    """
+    Portfolio-level risk controls for candidate sizing decisions.
+
+    Controls:
+        - Max 30% aggregate portfolio allocation
+        - Max 3 positions per sector
+        - Correlation-based size haircuts
+        - Portfolio-level VaR from weights, volatilities, and correlations
+    """
+
+    def __init__(
+        self,
+        max_total_allocation: float = MAX_TOTAL_PORTFOLIO_ALLOCATION,
+        max_positions_per_sector: int = MAX_POSITIONS_PER_SECTOR,
+        high_correlation_threshold: float = HIGH_CORRELATION_THRESHOLD,
+        max_correlation_size_cut: float = MAX_CORRELATION_SIZE_CUT,
+        var_zscore: float = VAR_ZSCORE_95,
+    ):
+        self.max_total_allocation = max_total_allocation
+        self.max_positions_per_sector = max_positions_per_sector
+        self.high_correlation_threshold = high_correlation_threshold
+        self.max_correlation_size_cut = max_correlation_size_cut
+        self.var_zscore = var_zscore
+        self.positions: Dict[str, PortfolioPosition] = {}
+
+    def total_exposure(self) -> float:
+        """Current aggregate portfolio allocation."""
+        return float(sum(position.weight for position in self.positions.values()))
+
+    def sector_counts(self) -> Dict[str, int]:
+        """Count active positions by sector."""
+        counts: Dict[str, int] = {}
+        for position in self.positions.values():
+            counts[position.sector] = counts.get(position.sector, 0) + 1
+        return counts
+
+    def _correlation_multiplier(
+        self,
+        symbol: str,
+        correlations: Optional[Dict[str, float]] = None,
+    ) -> float:
+        correlations = correlations or {}
+        relevant = [
+            abs(correlations[held_symbol])
+            for held_symbol in self.positions
+            if held_symbol != symbol and held_symbol in correlations
+        ]
+        if not relevant:
+            return 1.0
+
+        max_corr = max(relevant)
+        if max_corr < self.high_correlation_threshold:
+            return 1.0
+
+        scaled_excess = (max_corr - self.high_correlation_threshold) / max(
+            1e-9,
+            1.0 - self.high_correlation_threshold,
+        )
+        size_cut = min(self.max_correlation_size_cut, scaled_excess * self.max_correlation_size_cut)
+        return float(max(0.0, 1.0 - size_cut))
+
+    def register_position(
+        self,
+        symbol: str,
+        target_weight: float,
+        sector: str,
+        volatility: float,
+        correlations: Optional[Dict[str, float]] = None,
+    ) -> PositionDecision:
+        """
+        Add or update a position after applying portfolio-level constraints.
+
+        Returns the approved size along with the gating reasons used.
+        """
+        correlations = correlations or {}
+        existing = self.positions.get(symbol)
+        existing_weight = existing.weight if existing else 0.0
+        requested_weight = max(0.0, float(target_weight))
+
+        active_sector_count = sum(
+            1 for held_symbol, position in self.positions.items()
+            if position.sector == sector and held_symbol != symbol and position.weight > 0
+        )
+        is_new_sector_slot = existing is None or existing.sector != sector
+        reasons: List[str] = []
+
+        if active_sector_count >= self.max_positions_per_sector and is_new_sector_slot:
+            decision = PositionDecision(
+                symbol=symbol,
+                requested_weight=requested_weight,
+                approved_weight=0.0,
+                sector=sector,
+                total_exposure=self.total_exposure(),
+                remaining_capacity=max(0.0, self.max_total_allocation - self.total_exposure()),
+                sector_count=active_sector_count,
+                correlation_multiplier=1.0,
+                accepted=False,
+                reasons=[f"Sector cap reached for {sector} ({self.max_positions_per_sector} positions)"],
+            )
+            logger.info("Rejected %s due to sector cap: %s", symbol, decision.reasons[0])
+            return decision
+
+        gross_exposure_excluding_symbol = self.total_exposure() - existing_weight
+        remaining_capacity = max(0.0, self.max_total_allocation - gross_exposure_excluding_symbol)
+        approved_weight = min(requested_weight, remaining_capacity)
+        if approved_weight < requested_weight:
+            reasons.append(
+                f"Clamped by portfolio exposure cap to {approved_weight:.2%} (max {self.max_total_allocation:.0%})"
+            )
+
+        correlation_multiplier = self._correlation_multiplier(symbol, correlations=correlations)
+        if correlation_multiplier < 1.0 and approved_weight > 0:
+            approved_weight *= correlation_multiplier
+            reasons.append(
+                f"Reduced for correlation overlap (multiplier {correlation_multiplier:.2f})"
+            )
+
+        approved_weight = float(max(0.0, approved_weight))
+        accepted = approved_weight > 0
+
+        if accepted:
+            self.positions[symbol] = PortfolioPosition(
+                symbol=symbol,
+                weight=approved_weight,
+                sector=sector,
+                volatility=max(0.0, float(volatility)),
+                correlations={k: float(v) for k, v in correlations.items()},
+            )
+        else:
+            self.positions.pop(symbol, None)
+
+        total_exposure = self.total_exposure()
+        decision = PositionDecision(
+            symbol=symbol,
+            requested_weight=requested_weight,
+            approved_weight=approved_weight,
+            sector=sector,
+            total_exposure=total_exposure,
+            remaining_capacity=max(0.0, self.max_total_allocation - total_exposure),
+            sector_count=active_sector_count + (1 if accepted else 0),
+            correlation_multiplier=correlation_multiplier,
+            accepted=accepted,
+            reasons=reasons,
+        )
+        logger.debug(
+            "Portfolio decision: symbol=%s requested=%.4f approved=%.4f total=%.4f reasons=%s",
+            symbol,
+            requested_weight,
+            approved_weight,
+            total_exposure,
+            reasons,
+        )
+        return decision
+
+    def remove_position(self, symbol: str) -> None:
+        """Drop a tracked position from the portfolio view."""
+        self.positions.pop(symbol, None)
+
+    def _pairwise_correlation(self, left: str, right: str) -> float:
+        if left == right:
+            return 1.0
+        if left in self.positions and right in self.positions[left].correlations:
+            return float(self.positions[left].correlations[right])
+        if right in self.positions and left in self.positions[right].correlations:
+            return float(self.positions[right].correlations[left])
+        return 0.0
+
+    def compute_portfolio_var(self, zscore: Optional[float] = None) -> float:
+        """
+        Compute 1-day portfolio VaR as a fraction of portfolio value.
+
+        Formula:
+            VaR = z * sqrt(w^T Sigma w)
+        where Sigma_ij = corr_ij * vol_i * vol_j
+        """
+        if not self.positions:
+            return 0.0
+
+        symbols = list(self.positions.keys())
+        weights = np.array([self.positions[symbol].weight for symbol in symbols], dtype=float)
+        vols = np.array([max(0.0, self.positions[symbol].volatility) for symbol in symbols], dtype=float)
+
+        covariance = np.zeros((len(symbols), len(symbols)), dtype=float)
+        for i, left in enumerate(symbols):
+            for j, right in enumerate(symbols):
+                correlation = self._pairwise_correlation(left, right)
+                covariance[i, j] = correlation * vols[i] * vols[j]
+
+        portfolio_variance = float(weights.T @ covariance @ weights)
+        portfolio_volatility = np.sqrt(max(0.0, portfolio_variance))
+        return float((zscore or self.var_zscore) * portfolio_volatility)

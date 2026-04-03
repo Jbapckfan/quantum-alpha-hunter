@@ -11,5 +11,6 @@ from .empirical_combos import (
 )
 from .position_sizing import (
     KellyPositionSizer,
+    PortfolioRiskManager,
     ProfitTargetCalculator,
 )

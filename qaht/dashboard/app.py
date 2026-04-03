@@ -8,6 +8,7 @@ import plotly.graph_objects as go
 import plotly.express as px
 from datetime import datetime, timedelta
 import json
+import numbers
 
 from ..db import session_scope
 from ..schemas import Predictions, Factors, Labels, PriceOHLC
@@ -64,8 +65,15 @@ def load_watchlist(min_score: int = 70):
             except:
                 components = {}
 
+            feature_components = components.get("features", components)
+            numeric_features = [
+                (k, v)
+                for k, v in feature_components.items()
+                if isinstance(v, numbers.Number)
+            ]
+
             # Get top 3 features
-            top_features = sorted(components.items(), key=lambda x: abs(x[1]), reverse=True)[:3]
+            top_features = sorted(numeric_features, key=lambda x: abs(x[1]), reverse=True)[:3]
             top_features_str = ", ".join([f"{k}" for k, v in top_features])
 
             data.append({

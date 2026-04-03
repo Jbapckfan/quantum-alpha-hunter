@@ -19,6 +19,7 @@ import pandas as pd
 
 from ..db import session_scope
 from ..schemas import PriceOHLC, Factors, Regime, Predictions
+from ..utils.indicators import IndicatorCache
 from ..config import get_config
 from .position_sizing import KellyPositionSizer, ProfitTargetCalculator, KellyResult, ExitPlan
 from sqlalchemy import select
@@ -175,12 +176,16 @@ def detect_vol_accel(df: pd.DataFrame, window: int = 5) -> bool:
     return slope > 0
 
 
-def detect_rsi_oversold(df: pd.DataFrame, threshold: float = 30.0) -> bool:
+def detect_rsi_oversold(
+    df: pd.DataFrame,
+    threshold: float = 30.0,
+    indicator_cache: Optional[IndicatorCache] = None,
+) -> bool:
     """RSI-14 is below the oversold threshold."""
-    rsi = _compute_rsi(df)
-    if rsi is None:
+    rsi_value = _compute_rsi(df, indicator_cache=indicator_cache)
+    if rsi_value is None:
         return False
-    return rsi <= threshold
+    return rsi_value <= threshold
 
 
 def detect_low_in_range(df: pd.DataFrame, window: int = 20, pct: float = 0.20) -> bool:
@@ -225,20 +230,23 @@ def compute_price_vs_20d_low(df: pd.DataFrame) -> float:
     return float(df["close"].iloc[-1] / lo - 1.0)
 
 
-def _compute_rsi(df: pd.DataFrame, period: int = 14) -> Optional[float]:
+def _compute_rsi(
+    df: pd.DataFrame,
+    period: int = 14,
+    indicator_cache: Optional[IndicatorCache] = None,
+) -> Optional[float]:
     """Compute RSI-14 from close prices. Returns None if insufficient data."""
     if len(df) < period + 1:
         return None
-    close = df["close"].values
-    delta = np.diff(close[-(period + 1):])
-    gains = np.where(delta > 0, delta, 0.0)
-    losses = np.where(delta < 0, -delta, 0.0)
-    avg_gain = np.mean(gains)
-    avg_loss = np.mean(losses)
-    if avg_loss == 0:
-        return 100.0
-    rs = avg_gain / avg_loss
-    return float(100.0 - (100.0 / (1.0 + rs)))
+    cache = indicator_cache or IndicatorCache(
+        df,
+        close_col="close",
+        high_col="high",
+        low_col="low",
+    )
+    rsi_series = cache.rsi(period)
+    latest = rsi_series.iloc[-1]
+    return None if pd.isna(latest) else float(latest)
 
 
 # ============================================================================
@@ -278,6 +286,12 @@ def compute_all_signals(symbol: str, df: pd.DataFrame) -> SignalSnapshot:
         SignalSnapshot with all boolean flags and continuous values.
     """
     _require_ohlcv(df)
+    indicator_cache = IndicatorCache(
+        df,
+        close_col="close",
+        high_col="high",
+        low_col="low",
+    )
 
     snap = SignalSnapshot(symbol=symbol)
     snap.vol_zscore = compute_vol_zscore(df)
@@ -288,12 +302,12 @@ def compute_all_signals(symbol: str, df: pd.DataFrame) -> SignalSnapshot:
     snap.rejection_wicks = detect_rejection_wicks(df)
     snap.high_vol = detect_high_vol(df)
     snap.vol_accel = detect_vol_accel(df)
-    snap.rsi_oversold = detect_rsi_oversold(df)
+    snap.rsi_14 = _compute_rsi(df, indicator_cache=indicator_cache)
+    snap.rsi_oversold = snap.rsi_14 is not None and snap.rsi_14 <= 30.0
     snap.low_in_range = detect_low_in_range(df)
     snap.avg_volume_ratio = compute_avg_volume_ratio(df)
     snap.momentum_10d = compute_momentum_10d(df)
     snap.price_vs_20d_low = compute_price_vs_20d_low(df)
-    snap.rsi_14 = _compute_rsi(df)
 
     return snap
 

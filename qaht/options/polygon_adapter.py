@@ -8,9 +8,11 @@ and when wired into the broader QAH pipeline.
 """
 from __future__ import annotations
 
+import asyncio
 import os
 import logging
 from datetime import date, timedelta
+from time import monotonic
 from typing import Any, Dict, List, Optional
 
 import httpx
@@ -20,6 +22,8 @@ logger = logging.getLogger("qaht.options.polygon")
 
 _DEFAULT_BASE = "https://api.polygon.io"
 _HTTP_TIMEOUT = 10.0
+_SNAPSHOT_TTL_SECONDS = 60.0
+_RETRY_DELAYS = (1.0, 2.0, 4.0)
 
 
 class PolygonAPIError(Exception):
@@ -46,6 +50,9 @@ class PolygonAdapter:
         HTTP request timeout in seconds.
     """
 
+    _CLIENTS: Dict[tuple[str, str, float], httpx.AsyncClient] = {}
+    _SNAPSHOT_CACHE: Dict[str, tuple[float, Dict[str, Any]]] = {}
+
     def __init__(
         self,
         api_key: Optional[str] = None,
@@ -62,10 +69,22 @@ class PolygonAdapter:
             base_url or os.environ.get("MARKET_API_BASE", _DEFAULT_BASE)
         ).rstrip("/")
         self.timeout = timeout
+        self._client_key = (self.base_url, self.api_key, float(self.timeout))
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    def _get_client(self) -> httpx.AsyncClient:
+        """Return a shared AsyncClient for the adapter configuration."""
+        client = self._CLIENTS.get(self._client_key)
+        if client is None:
+            client = httpx.AsyncClient(
+                timeout=self.timeout,
+                limits=httpx.Limits(max_keepalive_connections=20, max_connections=50),
+            )
+            self._CLIENTS[self._client_key] = client
+        return client
 
     async def _get(self, url: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """Execute an authenticated GET and return decoded JSON.
@@ -75,24 +94,47 @@ class PolygonAdapter:
         """
         params = dict(params or {})
         params["apiKey"] = self.api_key
+        client = self._get_client()
+        last_error: Optional[Exception] = None
 
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            resp = await client.get(url, params=params)
+        for attempt in range(len(_RETRY_DELAYS) + 1):
+            if attempt > 0:
+                await asyncio.sleep(_RETRY_DELAYS[attempt - 1])
 
-        if resp.status_code != 200:
-            raise PolygonAPIError(
-                status_code=resp.status_code,
-                detail=f"Upstream error {resp.status_code}: {resp.text[:300]}",
-            )
+            try:
+                resp = await client.get(url, params=params)
+            except (httpx.TimeoutException, httpx.TransportError) as exc:
+                last_error = exc
+                if attempt == len(_RETRY_DELAYS):
+                    raise PolygonAPIError(status_code=502, detail=str(exc)) from exc
+                logger.warning("Polygon request transport retry %d for %s: %s", attempt + 1, url, exc)
+                continue
 
-        data = resp.json()
+            if resp.status_code != 200:
+                detail = f"Upstream error {resp.status_code}: {resp.text[:300]}"
+                retriable = resp.status_code in {429, 500, 502, 503, 504}
+                if retriable and attempt < len(_RETRY_DELAYS):
+                    last_error = PolygonAPIError(status_code=resp.status_code, detail=detail)
+                    logger.warning("Polygon request retry %d for %s: %s", attempt + 1, url, detail)
+                    continue
+                raise PolygonAPIError(status_code=resp.status_code, detail=detail)
 
-        # Polygon wraps some errors inside a 200 response.
-        if "status" in data and data["status"] not in ("OK", "ok", "success"):
-            if "error" in data:
-                raise PolygonAPIError(status_code=502, detail=data["error"])
+            data = resp.json()
 
-        return data
+            # Polygon wraps some errors inside a 200 response.
+            if "status" in data and data["status"] not in ("OK", "ok", "success"):
+                error_detail = data.get("error") or data.get("message") or "Polygon upstream error"
+                if attempt < len(_RETRY_DELAYS):
+                    last_error = PolygonAPIError(status_code=502, detail=error_detail)
+                    logger.warning("Polygon payload retry %d for %s: %s", attempt + 1, url, error_detail)
+                    continue
+                raise PolygonAPIError(status_code=502, detail=error_detail)
+
+            return data
+
+        if isinstance(last_error, PolygonAPIError):
+            raise last_error
+        raise PolygonAPIError(status_code=502, detail=str(last_error) if last_error else "Unknown Polygon error")
 
     # ------------------------------------------------------------------
     # Public API
@@ -106,7 +148,14 @@ class PolygonAdapter:
         Returns the raw ``ticker`` object from the Polygon response which
         contains ``lastTrade``, ``day``, ``prevDay``, ``min`` sub-dicts.
         """
-        url = f"{self.base_url}/v2/snapshot/locale/us/markets/stocks/tickers/{ticker.upper()}"
+        ticker = ticker.upper()
+        cache_key = f"{self.base_url}:{ticker}"
+        cache_entry = self._SNAPSHOT_CACHE.get(cache_key)
+        now = monotonic()
+        if cache_entry and cache_entry[0] > now:
+            return dict(cache_entry[1])
+
+        url = f"{self.base_url}/v2/snapshot/locale/us/markets/stocks/tickers/{ticker}"
         data = await self._get(url, {})
 
         t = data.get("ticker") or {}
@@ -126,7 +175,7 @@ class PolygonAdapter:
                 detail=f"Invalid price from snapshot for {ticker}",
             )
 
-        return {
+        snapshot = {
             "price": round(price, 2),
             "prev_close": round(float(prev_day.get("c") or 0.0), 2),
             "open": round(float(day_bar.get("o") or price), 2),
@@ -136,6 +185,8 @@ class PolygonAdapter:
             "volume": float(day_bar.get("v") or 0.0),
             "raw": t,
         }
+        self._SNAPSHOT_CACHE[cache_key] = (now + _SNAPSHOT_TTL_SECONDS, snapshot)
+        return dict(snapshot)
 
     async def get_daily_bars(
         self, ticker: str, days: int = 60

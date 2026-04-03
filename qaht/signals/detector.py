@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import date
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -20,6 +21,7 @@ import pandas as pd
 import yfinance as yf
 from scipy.signal import argrelextrema
 
+from ..utils.indicators import IndicatorCache
 from .weights import (
     STOCK_WEIGHTS,
     STOCK_CONFLUENCE_CATEGORIES,
@@ -32,6 +34,26 @@ from .weights import (
 logger = logging.getLogger("qaht.signals.detector")
 
 WEIGHTS_FILE = Path(__file__).resolve().parent / "stock_weights.json"
+_SPY_CACHE: Dict[str, Any] = {"date": None, "data": None}
+
+
+def _get_cached_spy_data() -> pd.DataFrame:
+    """Fetch SPY once per process day and reuse it across scans."""
+    cache_date = date.today().isoformat()
+    cached = _SPY_CACHE.get("data")
+    if isinstance(cached, pd.DataFrame) and _SPY_CACHE.get("date") == cache_date:
+        return cached
+
+    try:
+        spy_df = yf.Ticker("SPY").history(period="3mo", interval="1d")
+        if not spy_df.empty:
+            _SPY_CACHE["date"] = cache_date
+            _SPY_CACHE["data"] = spy_df
+            return spy_df
+    except Exception:
+        logger.debug("Failed to refresh cached SPY data", exc_info=True)
+
+    return cached if isinstance(cached, pd.DataFrame) else pd.DataFrame()
 
 
 # ---------------------------------------------------------------------------
@@ -46,12 +68,19 @@ class _SignalEngine:
     fetching, scoring, and result packaging.
     """
 
-    def __init__(self, df: pd.DataFrame, info: Optional[Dict[str, Any]] = None) -> None:
+    def __init__(
+        self,
+        df: pd.DataFrame,
+        info: Optional[Dict[str, Any]] = None,
+        spy_df: Optional[pd.DataFrame] = None,
+    ) -> None:
         self.df = df.copy()
         self.info = info or {}
+        self.spy_df = spy_df
         self.current: float = float(df.iloc[-1]["Close"])
         self.signals: Dict[str, bool] = {}
         self.signal_details: Dict[str, Any] = {}
+        self._context_cache: Dict[str, Any] = {}
 
         self._calculate_indicators()
 
@@ -60,45 +89,38 @@ class _SignalEngine:
     def _calculate_indicators(self) -> None:
         """Pre-calculate all technical indicators on *self.df*."""
         df = self.df
+        self.indicators = IndicatorCache(df, close_col="Close", high_col="High", low_col="Low")
 
         # EMAs
-        df["EMA5"] = df["Close"].ewm(span=5).mean()
-        df["EMA10"] = df["Close"].ewm(span=10).mean()
-        df["EMA20"] = df["Close"].ewm(span=20).mean()
-        df["EMA50"] = df["Close"].ewm(span=50).mean()
+        df["EMA5"] = self.indicators.ema(5)
+        df["EMA10"] = self.indicators.ema(10)
+        df["EMA20"] = self.indicators.ema(20)
+        df["EMA50"] = self.indicators.ema(50)
 
         # SMAs
         df["SMA20"] = df["Close"].rolling(20).mean()
         df["SMA50"] = df["Close"].rolling(50).mean()
         df["SMA200"] = df["Close"].rolling(200).mean()
 
-        # RSI (14-period Wilder)
-        delta = df["Close"].diff()
-        gain = delta.where(delta > 0, 0).rolling(14).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
-        rs = gain / loss
-        df["RSI"] = 100 - (100 / (1 + rs))
+        # RSI (14)
+        df["RSI"] = self.indicators.rsi(14)
 
         # MACD (12/26/9)
-        ema12 = df["Close"].ewm(span=12).mean()
-        ema26 = df["Close"].ewm(span=26).mean()
-        df["MACD"] = ema12 - ema26
-        df["MACD_Signal"] = df["MACD"].ewm(span=9).mean()
-        df["MACD_Hist"] = df["MACD"] - df["MACD_Signal"]
+        macd = self.indicators.macd()
+        df["MACD"] = macd.line
+        df["MACD_Signal"] = macd.signal
+        df["MACD_Hist"] = macd.hist
 
         # Bollinger Bands (20, 2)
-        df["BB_Mid"] = df["Close"].rolling(20).mean()
-        df["BB_Std"] = df["Close"].rolling(20).std()
-        df["BB_Upper"] = df["BB_Mid"] + 2 * df["BB_Std"]
-        df["BB_Lower"] = df["BB_Mid"] - 2 * df["BB_Std"]
-        df["BB_Width"] = (df["BB_Upper"] - df["BB_Lower"]) / df["BB_Mid"]
+        bollinger = self.indicators.bollinger_bands()
+        df["BB_Mid"] = bollinger.mid
+        df["BB_Std"] = bollinger.std
+        df["BB_Upper"] = bollinger.upper
+        df["BB_Lower"] = bollinger.lower
+        df["BB_Width"] = bollinger.width
 
         # ATR (14)
-        high_low = df["High"] - df["Low"]
-        high_close = (df["High"] - df["Close"].shift()).abs()
-        low_close = (df["Low"] - df["Close"].shift()).abs()
-        tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-        df["ATR"] = tr.rolling(14).mean()
+        df["ATR"] = self.indicators.atr(14)
 
         # Volume averages
         df["Vol_SMA20"] = df["Volume"].rolling(20).mean()
@@ -110,6 +132,179 @@ class _SignalEngine:
         # 52-week extremes
         self.high_52w: float = float(df["High"].max())
         self.low_52w: float = float(df["Low"].min())
+
+    def _cached(self, key: str, factory: Any) -> Any:
+        if key not in self._context_cache:
+            self._context_cache[key] = factory()
+        return self._context_cache[key]
+
+    def _get_base_days(self) -> pd.DataFrame:
+        base_threshold = self.low_52w * 1.30
+        return self._cached("base_days", lambda: self.df[self.df["Close"] < base_threshold])
+
+    def _get_local_lows(self) -> np.ndarray:
+        return self._cached(
+            "local_lows",
+            lambda: argrelextrema(self.df["Low"].values, np.less, order=5)[0],
+        )
+
+    def _get_local_highs(self) -> np.ndarray:
+        return self._cached(
+            "local_highs",
+            lambda: argrelextrema(self.df["High"].values, np.greater, order=5)[0],
+        )
+
+    def _consecutive_true_age(self, condition: pd.Series, max_lookback: int = 15) -> int:
+        series = condition.fillna(False).astype(bool).tail(max_lookback)
+        if series.empty or not bool(series.iloc[-1]):
+            return 0
+
+        age = 0
+        for value in reversed(series.tolist()):
+            if value:
+                age += 1
+            else:
+                break
+        return max(0, age - 1)
+
+    def _recent_event_age(self, condition: pd.Series, max_lookback: int = 15) -> int:
+        series = condition.fillna(False).astype(bool).tail(max_lookback)
+        if series.empty or not series.any():
+            return 0
+
+        event_positions = np.flatnonzero(series.to_numpy())
+        return int(len(series) - 1 - event_positions[-1])
+
+    def _age_from_detail_date(self, detail_key: str) -> int:
+        date_str = self.signal_details.get(detail_key)
+        if not date_str:
+            return 0
+
+        signal_date = pd.Timestamp(date_str).normalize()
+        matches = np.flatnonzero(self.df.index.normalize() == signal_date)
+        if len(matches) == 0:
+            return 0
+        return int(len(self.df) - 1 - matches[-1])
+
+    def _freshness_multiplier(self, age: int) -> float:
+        if age <= 3:
+            return 1.5
+        if age <= 7:
+            return 1.0
+        return 0.5
+
+    def _has_momentum_confirmation(self) -> bool:
+        df = self.df
+        if len(df) < 20:
+            self.signal_details["volume_trend_ratio"] = 1.0
+            return False
+
+        higher_lows = self.signals.get("first_higher_low", False)
+        if not higher_lows:
+            recent_low = float(df["Low"].iloc[-10:].min())
+            prior_low = float(df["Low"].iloc[-20:-10].min())
+            higher_lows = recent_low > prior_low
+
+        recent_vol = float(df["Volume"].iloc[-3:].mean())
+        prior_vol = float(df["Volume"].iloc[-8:-3].mean())
+        vol_ratio = recent_vol / prior_vol if prior_vol > 0 else 1.0
+        self.signal_details["volume_trend_ratio"] = round(vol_ratio, 2)
+
+        return higher_lows and vol_ratio > 1.10
+
+    def _estimate_signal_ages(self) -> Dict[str, int]:
+        df = self.df
+        ages: Dict[str, int] = {}
+
+        state_resolvers = {
+            "above_ema20": lambda: self._consecutive_true_age(df["Close"] > df["EMA20"]),
+            "above_ema50": lambda: self._consecutive_true_age(df["Close"] > df["EMA50"]),
+            "ema_stack_bullish": lambda: self._consecutive_true_age(
+                (df["Close"] > df["EMA5"])
+                & (df["EMA5"] > df["EMA10"])
+                & (df["EMA10"] > df["EMA20"])
+            ),
+            "macd_bullish": lambda: self._consecutive_true_age(df["MACD"] > df["MACD_Signal"]),
+            "rsi_recovering": lambda: self._consecutive_true_age(
+                (df["RSI"] > 50) & (df["RSI"] > df["RSI"].shift(3))
+            ),
+            "rsi_thrust": lambda: self._consecutive_true_age(
+                (df["RSI"] > 50) & (df["RSI"].rolling(20, min_periods=1).min() < 40)
+            ),
+            "rsi_oversold_bounce": lambda: self._consecutive_true_age(
+                (df["RSI"] > 35) & (df["RSI"].rolling(5, min_periods=1).min() < 30)
+            ),
+            "bollinger_squeeze": lambda: self._consecutive_true_age(
+                df["BB_Width"] < df["BB_Width"].rolling(50, min_periods=1).mean() * 0.7
+            ),
+            "atr_contracting": lambda: self._consecutive_true_age(
+                df["ATR"] < df["ATR"].rolling(50, min_periods=1).mean() * 0.8
+            ),
+            "holding_above_support": lambda: self._consecutive_true_age(
+                df["Close"] > df["Low"].rolling(60, min_periods=1).min() * 1.05
+            ),
+            "near_breakout_level": lambda: self._consecutive_true_age(
+                (df["High"].rolling(20, min_periods=1).max() * 0.95 <= df["Close"])
+                & (df["Close"] < df["High"].rolling(20, min_periods=1).max())
+            ),
+        }
+        event_resolvers = {
+            "big_day_15": lambda: self._recent_event_age(df["Return"] >= 15),
+            "big_day_10": lambda: self._recent_event_age(df["Return"] >= 10),
+            "momentum_day": lambda: self._recent_event_age(df["Return"] >= 5),
+            "breakout_attempt": lambda: self._recent_event_age(
+                df["Close"] >= df["High"].rolling(20, min_periods=1).max().shift(1) * 0.95
+            ),
+            "ema_reclaim_sequence": lambda: self._recent_event_age(
+                (df["Close"] > df["EMA20"]) & (df["Close"].shift(1) <= df["EMA20"].shift(1))
+            ),
+            "golden_cross_near": lambda: self._recent_event_age(
+                df["EMA50"].notna()
+                & (((df["EMA20"] - df["EMA50"]) / df["EMA50"].replace(0.0, np.nan) * 100).between(-5, 5))
+                & (df["EMA20"] > df["EMA20"].shift(5))
+            ),
+            "macd_bullish_cross": lambda: self._recent_event_age(
+                (df["MACD"] > df["MACD_Signal"])
+                & (df["MACD"].shift(1) <= df["MACD_Signal"].shift(1))
+            ),
+            "macd_histogram_rising": lambda: self._recent_event_age(
+                (df["MACD_Hist"] > df["MACD_Hist"].shift(3))
+                & (df["MACD_Hist"] > df["MACD_Hist"].rolling(5, min_periods=1).min())
+            ),
+        }
+
+        for signal in self.signals:
+            if signal in state_resolvers:
+                ages[signal] = state_resolvers[signal]()
+            elif signal in event_resolvers:
+                ages[signal] = event_resolvers[signal]()
+            elif signal == "first_higher_low":
+                ages[signal] = self._age_from_detail_date("higher_low_date")
+            elif signal == "first_higher_high":
+                ages[signal] = self._age_from_detail_date("higher_high_date")
+            else:
+                ages[signal] = 0
+
+        if self.signals.get("outperforming_spy_5d") or self.signals.get("outperforming_spy_20d"):
+            spy = self.spy_df if self.spy_df is not None else _get_cached_spy_data()
+            if not spy.empty:
+                stock_5d = df["Close"].pct_change(5)
+                spy_5d = spy["Close"].pct_change(5).reindex(df.index, method="ffill")
+                stock_20d = df["Close"].pct_change(20)
+                spy_20d = spy["Close"].pct_change(20).reindex(df.index, method="ffill")
+                if self.signals.get("outperforming_spy_5d"):
+                    ages["outperforming_spy_5d"] = self._consecutive_true_age(stock_5d > spy_5d)
+                if self.signals.get("outperforming_spy_20d"):
+                    ages["outperforming_spy_20d"] = self._consecutive_true_age(stock_20d > spy_20d)
+
+        return ages
+
+    def _finalize_signal_context(self) -> None:
+        ages = self._estimate_signal_ages()
+        freshness = {signal: self._freshness_multiplier(age) for signal, age in ages.items()}
+        self.signal_details["signal_ages"] = ages
+        self.signal_details["freshness_weights"] = freshness
+        self.signal_details["momentum_confirmation"] = self._has_momentum_confirmation()
 
     # ----- orchestrator -----------------------------------------------------
 
@@ -129,6 +324,7 @@ class _SignalEngine:
         self._detect_analyst_signals()
         self._detect_exceptional_signals()
         self._detect_quality_filters()
+        self._finalize_signal_context()
         return self.signals, self.signal_details
 
     # ----- washout ----------------------------------------------------------
@@ -151,8 +347,7 @@ class _SignalEngine:
 
     def _detect_base_signals(self) -> None:
         """Detect base formation signals (consolidation near lows)."""
-        base_threshold = self.low_52w * 1.30
-        base_days = self.df[self.df["Close"] < base_threshold]
+        base_days = self._get_base_days()
 
         if len(base_days) >= 10:
             base_low = float(base_days["Low"].min())
@@ -176,8 +371,7 @@ class _SignalEngine:
         df = self.df
 
         # Volume dry-up during base period
-        base_threshold = self.low_52w * 1.30
-        base_days = df[df["Close"] < base_threshold]
+        base_days = self._get_base_days()
 
         if len(base_days) >= 10:
             base_vol = float(base_days["Volume"].mean())
@@ -233,7 +427,7 @@ class _SignalEngine:
             self.signals["momentum_day"] = True
 
         # First higher low detection via argrelextrema
-        lows = argrelextrema(df["Low"].values, np.less, order=5)[0]
+        lows = self._get_local_lows()
         if len(lows) >= 2:
             recent_lows = lows[-2:]
             if df["Low"].iloc[recent_lows[-1]] > df["Low"].iloc[recent_lows[-2]]:
@@ -243,7 +437,7 @@ class _SignalEngine:
                 )
 
         # First higher high detection
-        highs = argrelextrema(df["High"].values, np.greater, order=5)[0]
+        highs = self._get_local_highs()
         if len(highs) >= 2:
             recent_highs = highs[-2:]
             if df["High"].iloc[recent_highs[-1]] > df["High"].iloc[recent_highs[-2]]:
@@ -318,7 +512,7 @@ class _SignalEngine:
             self.signals["rsi_oversold_bounce"] = True
 
         # RSI bullish divergence (price lower low, RSI higher low)
-        price_lows = argrelextrema(df["Low"].values, np.less, order=5)[0]
+        price_lows = self._get_local_lows()
         if len(price_lows) >= 2:
             recent_price_lows = price_lows[-2:]
             price_ll = (
@@ -357,7 +551,7 @@ class _SignalEngine:
             self.signals["macd_histogram_rising"] = True
 
         # MACD bullish divergence (price lower low, MACD higher low)
-        price_lows = argrelextrema(df["Low"].values, np.less, order=5)[0]
+        price_lows = self._get_local_lows()
         if len(price_lows) >= 2:
             recent_price_lows = price_lows[-2:]
             price_ll = (
@@ -435,7 +629,7 @@ class _SignalEngine:
         """Detect relative strength vs SPY."""
         df = self.df
         try:
-            spy = yf.Ticker("SPY").history(period="1mo")
+            spy = self.spy_df if self.spy_df is not None else _get_cached_spy_data()
             if spy.empty:
                 return
 
@@ -453,7 +647,7 @@ class _SignalEngine:
                     self.signals["outperforming_spy_20d"] = True
                 self.signal_details["rs_vs_spy_20d"] = round(stock_20d - spy_20d, 1)
         except Exception:
-            logger.debug("Failed to fetch SPY data for relative strength", exc_info=True)
+            logger.debug("Failed to fetch cached SPY data for relative strength", exc_info=True)
 
     # ----- stage determination ----------------------------------------------
 
@@ -603,7 +797,7 @@ class _SignalEngine:
                         max_down_vol = max(max_down_vol, float(df["Volume"].iloc[i]))
 
                 if max_down_vol > 0 and today_vol > max_down_vol:
-                    ema21 = float(df["Close"].ewm(span=21).mean().iloc[-1])
+                    ema21 = float(self.indicators.ema(21).iloc[-1])
                     if today_close <= ema21 * 1.10:
                         self.signals["pocket_pivot"] = True
 
@@ -660,7 +854,7 @@ class StockSignalDetector:
 
     # ----- single ticker scan -----------------------------------------------
 
-    def scan(self, ticker: str) -> Optional[Dict[str, Any]]:
+    def scan(self, ticker: str, spy_df: Optional[pd.DataFrame] = None) -> Optional[Dict[str, Any]]:
         """
         Perform a full scan of *ticker* and return a result dict, or ``None``
         if the ticker is ineligible (insufficient data, price filters, etc.).
@@ -677,33 +871,37 @@ class StockSignalDetector:
             current = float(df.iloc[-1]["Close"])
 
             # --- run signal detection ---
-            engine = _SignalEngine(df, info)
+            engine = _SignalEngine(df, info, spy_df=spy_df)
             signals, details = engine.detect_all_signals()
+            prepared_df = engine.df
 
             # --- weighted scoring ---
-            score = 0
+            score = 0.0
             triggered_signals: List[str] = []
-            signal_scores: Dict[str, int] = {}
+            signal_scores: Dict[str, float] = {}
+            freshness_weights = details.get("freshness_weights", {})
 
             for signal, triggered in signals.items():
                 if triggered and signal in self.weights:
-                    weight = self.weights[signal]
-                    score += weight
+                    weight = float(self.weights[signal])
+                    freshness_weight = float(freshness_weights.get(signal, 1.0))
+                    weighted_score = weight * freshness_weight
+                    score += weighted_score
                     triggered_signals.append(signal)
-                    signal_scores[signal] = weight
+                    signal_scores[signal] = round(weighted_score, 2)
 
             # --- confluence multiplier ---
             multiplier = compute_stock_confluence(triggered_signals)
             if multiplier > 1.0:
                 bonus_key = f"confluence_{int((multiplier - 1) * 10)}"
-                signal_scores[bonus_key] = int(score * (multiplier - 1))
-            score = int(score * multiplier)
+                signal_scores[bonus_key] = round(score * (multiplier - 1), 2)
+            score *= multiplier
 
             # --- risk/reward adjustment ---
             high_52w = engine.high_52w
             low_52w = engine.low_52w
-            atr = float(df["ATR"].iloc[-1]) if "ATR" in df.columns else float(
-                (df["High"] - df["Low"]).tail(14).mean()
+            atr = float(prepared_df["ATR"].iloc[-1]) if "ATR" in prepared_df.columns else float(
+                (prepared_df["High"] - prepared_df["Low"]).tail(14).mean()
             )
             stop = max(low_52w * 0.95, current - 2 * atr)
             r_unit = current - stop
@@ -721,15 +919,23 @@ class StockSignalDetector:
             if rr_ratio > 5:
                 rr_weight = self.weights.get("rr_excellent", 10)
                 score += rr_weight
-                signal_scores["rr_excellent"] = rr_weight
+                signal_scores["rr_excellent"] = float(rr_weight)
             elif rr_ratio > 3:
                 rr_weight = self.weights.get("rr_good", 5)
                 score += rr_weight
-                signal_scores["rr_good"] = rr_weight
+                signal_scores["rr_good"] = float(rr_weight)
             elif rr_ratio < 2:
                 rr_weight = self.weights.get("rr_poor", -8)
                 score += rr_weight
-                signal_scores["rr_poor"] = rr_weight
+                signal_scores["rr_poor"] = float(rr_weight)
+
+            # --- momentum confirmation bonus ---
+            if details.get("momentum_confirmation"):
+                momentum_bonus = score * 0.20
+                score += momentum_bonus
+                signal_scores["momentum_confirmation_bonus"] = round(momentum_bonus, 2)
+
+            score = int(round(score))
 
             # --- build flags from top signals ---
             flags: List[str] = []
@@ -752,6 +958,8 @@ class StockSignalDetector:
                 "flags": flags,
                 "signal_breakdown": signal_scores,
                 "details": details,
+                "freshness_weights": freshness_weights,
+                "momentum_confirmation": bool(details.get("momentum_confirmation", False)),
                 "drawdown": details.get("drawdown", 0),
                 "rally_from_low": details.get("rally_from_low", 0),
                 "base_tightness": details.get("base_tightness", 0),
@@ -792,9 +1000,10 @@ class StockSignalDetector:
         (descending), filtered to *min_score*.
         """
         results: List[Dict[str, Any]] = []
+        spy_df = _get_cached_spy_data()
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {executor.submit(self.scan, t): t for t in tickers}
+            futures = {executor.submit(self.scan, t, spy_df): t for t in tickers}
             for future in as_completed(futures):
                 result = future.result()
                 if result and result["score"] >= min_score:

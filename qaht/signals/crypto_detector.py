@@ -25,6 +25,7 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 
+from ..utils.indicators import IndicatorCache
 from .weights import (
     CRYPTO_WEIGHTS,
     compute_crypto_confluence,
@@ -87,39 +88,32 @@ class _CryptoSignalEngine:
 
     def _calculate_indicators(self) -> None:
         df = self.df
+        self.indicators = IndicatorCache(df, close_col="Close", high_col="High", low_col="Low")
 
         # EMAs
-        df["ema20"] = df["Close"].ewm(span=20).mean()
-        df["ema50"] = df["Close"].ewm(span=50).mean()
-        df["ema200"] = df["Close"].ewm(span=200).mean()
+        df["ema20"] = self.indicators.ema(20)
+        df["ema50"] = self.indicators.ema(50)
+        df["ema200"] = self.indicators.ema(200)
 
         # RSI (14)
-        delta = df["Close"].diff()
-        gain = delta.where(delta > 0, 0).rolling(window=14).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-        rs = gain / loss
-        df["rsi"] = 100 - (100 / (1 + rs))
+        df["rsi"] = self.indicators.rsi(14)
 
         # MACD (12/26/9)
-        exp1 = df["Close"].ewm(span=12).mean()
-        exp2 = df["Close"].ewm(span=26).mean()
-        df["macd"] = exp1 - exp2
-        df["macd_signal"] = df["macd"].ewm(span=9).mean()
-        df["macd_hist"] = df["macd"] - df["macd_signal"]
+        macd = self.indicators.macd()
+        df["macd"] = macd.line
+        df["macd_signal"] = macd.signal
+        df["macd_hist"] = macd.hist
 
         # Bollinger Bands (20, 2)
-        df["bb_mid"] = df["Close"].rolling(window=20).mean()
-        df["bb_std"] = df["Close"].rolling(window=20).std()
-        df["bb_upper"] = df["bb_mid"] + df["bb_std"] * 2
-        df["bb_lower"] = df["bb_mid"] - df["bb_std"] * 2
-        df["bb_width"] = (df["bb_upper"] - df["bb_lower"]) / df["bb_mid"]
+        bollinger = self.indicators.bollinger_bands()
+        df["bb_mid"] = bollinger.mid
+        df["bb_std"] = bollinger.std
+        df["bb_upper"] = bollinger.upper
+        df["bb_lower"] = bollinger.lower
+        df["bb_width"] = bollinger.width
 
         # ATR (14)
-        high_low = df["High"] - df["Low"]
-        high_close = (df["High"] - df["Close"].shift()).abs()
-        low_close = (df["Low"] - df["Close"].shift()).abs()
-        tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-        df["atr"] = tr.rolling(window=14).mean()
+        df["atr"] = self.indicators.atr(14)
 
         # Volume metrics
         df["vol_sma20"] = df["Volume"].rolling(window=20).mean()

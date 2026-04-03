@@ -4,7 +4,7 @@ Self-optimizing via monthly weight updates
 """
 import pandas as pd
 import numpy as np
-from typing import Optional, Dict, List
+from typing import Any, Optional, Dict, List
 import logging
 import pickle
 from pathlib import Path
@@ -17,13 +17,92 @@ from sklearn.calibration import CalibratedClassifierCV
 from sklearn.isotonic import IsotonicRegression
 
 from ..db import session_scope
-from ..schemas import Factors, Labels, Predictions
+from ..schemas import Factors, Labels, Predictions, PriceOHLC
 from ..config import get_config
 from .registry import FEATURES, validate_features, get_features_for_asset_type
+from .empirical_combos import EmpiricalScorer, RegimeState, RegimeType
 from sqlalchemy import select, text
 
 logger = logging.getLogger("qaht.scoring.ridge")
 config = get_config()
+
+
+def _conviction_from_score(score: float) -> str:
+    """Map a 0-100 score to a conviction bucket."""
+    if score >= 90:
+        return "MAX"
+    if score >= 80:
+        return "HIGH"
+    if score >= 70:
+        return "MED"
+    return "LOW"
+
+
+def load_price_history(symbols: List[str], asset_type: str = 'stock') -> Dict[str, pd.DataFrame]:
+    """Load OHLCV history for a batch of symbols from the database."""
+    if not symbols:
+        return {}
+
+    with session_scope() as session:
+        rows = session.execute(
+            select(PriceOHLC)
+            .where(PriceOHLC.symbol.in_(symbols))
+            .where(PriceOHLC.asset_type == asset_type)
+            .order_by(PriceOHLC.symbol, PriceOHLC.date)
+        ).scalars().all()
+
+    history: Dict[str, List[Dict[str, Any]]] = {}
+    for row in rows:
+        history.setdefault(row.symbol, []).append(
+            {
+                "date": row.date,
+                "open": row.open,
+                "high": row.high,
+                "low": row.low,
+                "close": row.close,
+                "volume": row.volume,
+            }
+        )
+
+    return {
+        symbol: pd.DataFrame(records)
+        for symbol, records in history.items()
+        if records
+    }
+
+
+def _extract_triggered_empirical_signals(result: Any) -> List[str]:
+    """Return boolean empirical signals that fired for a symbol."""
+    return [
+        name
+        for name, value in vars(result.signals).items()
+        if name != "symbol" and isinstance(value, bool) and value
+    ]
+
+
+def _build_conviction_reasons(
+    ml_quantum_score: int,
+    empirical_result: Optional[Any],
+) -> List[str]:
+    """Create a compact set of reasons behind a score."""
+    reasons = [f"ML baseline score {ml_quantum_score}"]
+
+    if empirical_result is None:
+        reasons.append("Empirical combo score unavailable")
+        return reasons
+
+    reasons.append(f"Empirical combo score {empirical_result.combo_score:.1f}")
+
+    for combo in empirical_result.matched_combos[:3]:
+        reasons.append(f"Matched {combo.name} ({combo.hit_rate:.1%} hit rate)")
+
+    triggered_signals = _extract_triggered_empirical_signals(empirical_result)
+    if triggered_signals:
+        reasons.append(
+            "Signals fired: " + ", ".join(triggered_signals[:5])
+        )
+
+    return reasons
 
 
 def load_training_data(symbols: Optional[List[str]] = None, asset_type: str = 'stock') -> pd.DataFrame:
@@ -204,24 +283,17 @@ def score_symbols(symbols: List[str], model_dict: Dict, asset_type: str = 'stock
             # Quantum score (0-100 scale)
             quantum_score = int(prob_explosion * 100)
 
-            # Conviction level
-            if quantum_score >= 90:
-                conviction = "MAX"
-            elif quantum_score >= 80:
-                conviction = "HIGH"
-            elif quantum_score >= 70:
-                conviction = "MED"
-            else:
-                conviction = "LOW"
-
             results.append({
                 'symbol': symbol,
                 'date': factor.date,
                 'quantum_score': quantum_score,
+                'ml_quantum_score': quantum_score,
+                'empirical_combo_score': None,
                 'prob_hit_10d': prob_explosion,
                 'pred_return': pred_return,
-                'conviction_level': conviction,
-                'components': feature_values  # For explainability
+                'conviction_level': _conviction_from_score(quantum_score),
+                'components': feature_values,
+                'conviction_reasons': [],
             })
 
     df = pd.DataFrame(results)
@@ -285,6 +357,58 @@ def train_and_score(symbols: List[str], asset_type: str = 'stock'):
     scores = score_symbols(symbols, model_dict, asset_type)
 
     if not scores.empty:
+        price_history = load_price_history(scores['symbol'].tolist(), asset_type=asset_type)
+        empirical_scorer = EmpiricalScorer()
+        neutral_regime = RegimeState(
+            regime=RegimeType.NEUTRAL,
+            ev_adjustment=0.0,
+            position_size_mult=1.0,
+        )
+
+        for idx, row in scores.iterrows():
+            symbol = row['symbol']
+            ml_quantum_score = int(row['ml_quantum_score'])
+            components = {'features': dict(row['components'])}
+            empirical_df = price_history.get(symbol)
+            empirical_result = None
+
+            if empirical_df is not None and len(empirical_df) >= 30:
+                empirical_result = empirical_scorer.score_symbol(
+                    symbol=symbol,
+                    df=empirical_df,
+                    quantum_score=None,
+                    entry_price=float(empirical_df['close'].iloc[-1]),
+                    regime=neutral_regime,
+                )
+                empirical_combo_score = round(empirical_result.combo_score, 2)
+                hybrid_score = int(round((0.4 * ml_quantum_score) + (0.6 * empirical_result.combo_score)))
+
+                matched_combos = [combo.name for combo in empirical_result.matched_combos]
+                triggered_signals = _extract_triggered_empirical_signals(empirical_result)
+
+                components.update({
+                    'ml_quantum_score': ml_quantum_score,
+                    'empirical_combo_score': empirical_combo_score,
+                    'matched_combos': matched_combos,
+                    'triggered_empirical_signals': triggered_signals,
+                })
+
+                scores.at[idx, 'empirical_combo_score'] = empirical_combo_score
+                scores.at[idx, 'quantum_score'] = hybrid_score
+                scores.at[idx, 'conviction_level'] = _conviction_from_score(hybrid_score)
+            else:
+                components.update({
+                    'ml_quantum_score': ml_quantum_score,
+                    'empirical_combo_score': None,
+                    'matched_combos': [],
+                    'triggered_empirical_signals': [],
+                })
+
+            conviction_reasons = _build_conviction_reasons(ml_quantum_score, empirical_result)
+            components['conviction_reasons'] = conviction_reasons
+            scores.at[idx, 'conviction_reasons'] = conviction_reasons
+            scores.at[idx, 'components'] = components
+
         # Save predictions
         upsert_predictions(scores)
 
